@@ -80,7 +80,11 @@ int UrmaTransport::Reset(int32_t /*expected_nref*/) {
 }
 
 std::shared_ptr<AppConnect> UrmaTransport::Connect() {
-    if (_default_connect == nullptr) {
+    // Socket pools and short connections inherit the main socket's
+    // app_connect. UrmaConnect owns a pending handshake callback and must
+    // never be shared by concurrently connecting sockets.
+    if (_default_connect == nullptr ||
+        dynamic_cast<urma::UrmaConnect*>(_default_connect.get()) != nullptr) {
         return std::make_shared<urma::UrmaConnect>();
     }
     return _default_connect;

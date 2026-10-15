@@ -165,16 +165,16 @@ public:
     // to false (returns 0) if the message is invalid.
     int ReadAndParseHelloV3(ParsedHello* out, bool* negotiated);
 
-    // Apply the peer's negotiated parameters (window sizes, peer jetty/seg).
+    // Apply the peer's negotiated parameters (receive size and destination SocketId).
     void ApplyRemoteHello(const ParsedHello& remote);
 
 private:
     enum State {
         UNINIT = 0x0,
-        C_ALLOC_RES   = 0x1,  // client: allocate Jetty/JFC/JFR
+        C_ALLOC_RES   = 0x1,  // client: select shared JFR
         C_HELLO_SEND  = 0x2,
         C_HELLO_WAIT  = 0x3,
-        C_IMPORT_PEER = 0x4,  // urma_import_seg then urma_import_jetty
+        C_IMPORT_PEER = 0x4,  // urma_import_seg then urma_import_jfr
         C_ACK_SEND    = 0x5,
         S_HELLO_WAIT  = 0x11,
         S_ALLOC_RES   = 0x12,
@@ -194,8 +194,8 @@ private:
     int AllocateResources();
     void DeallocateResources();
 
-    // Import the peer's jetty and buffer-pool segment. CRITICAL:
-    // urma_import_seg is called BEFORE urma_import_jetty, otherwise the kernel
+    // Import the peer's shared JFR and buffer-pool segment. CRITICAL:
+    // urma_import_seg is called BEFORE urma_import_jfr, otherwise the kernel
     // does not establish the transport-path routing for the remote EID and
     // the first SEND is rejected with URMA_CR_RNR_RETRY_CNT_EXC_ERR.
     // Returns 0 on success.
@@ -258,6 +258,8 @@ private:
     butil::Mutex _dispatch_mutex;
 
     std::shared_ptr<UrmaConnResource> _conn_res;
+    SocketId _self_socket_id{INVALID_SOCKET_ID};
+    SocketId _peer_socket_id{INVALID_SOCKET_ID};
 
     // ---- Send / recv window bookkeeping ----
     uint16_t _sq_size{0};   // local JFS depth
