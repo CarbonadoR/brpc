@@ -17,6 +17,12 @@
 
 #include <cstring>
 #include <limits>
+#include <algorithm>
+#include <atomic>
+#include <set>
+#include <thread>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 
@@ -27,6 +33,12 @@
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma/urma_endpoint.h"
+#include "brpc/urma_transport.h"
+#include "brpc/server.h"
+#include "bthread/bthread.h"
+#include "brpc/controller.h"
+#include "echo.pb.h"
 #include "urma_types.h"
 
 using namespace brpc;
@@ -51,7 +63,8 @@ TEST(UrmaHandshakeTest, v2_serialize_deserialize_roundtrip) {
     m.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
     m.buffer_size = 8192;
     m.recv_buffer_cnt = 127;
-    m.jetty_id = 0x12345678;
+    m.jfr_id = 0x12345678;
+    m.socket_id = 0x123456789abcdef0ULL;
     for (int i = 0; i < 16; ++i) {
         m.eid[i] = static_cast<uint8_t>(i + 1);
     }
@@ -75,7 +88,8 @@ TEST(UrmaHandshakeTest, v2_serialize_deserialize_roundtrip) {
     EXPECT_EQ(m.impl_ver, m2.impl_ver);
     EXPECT_EQ(m.buffer_size, m2.buffer_size);
     EXPECT_EQ(m.recv_buffer_cnt, m2.recv_buffer_cnt);
-    EXPECT_EQ(m.jetty_id, m2.jetty_id);
+    EXPECT_EQ(m.jfr_id, m2.jfr_id);
+    EXPECT_EQ(m.socket_id, m2.socket_id);
     EXPECT_EQ(0, memcmp(m.eid, m2.eid, 16));
     EXPECT_EQ(m.uasid, m2.uasid);
     EXPECT_EQ(m.tp_type, m2.tp_type);
@@ -93,7 +107,7 @@ TEST(UrmaHandshakeTest, v2_packet_magic_is_urma) {
     EXPECT_EQ(4u, urma::v2_wire::MAGIC_STR_LEN);
     char magic[4] = {'U', 'R', 'M', 'A'};
     EXPECT_EQ(0, memcmp(magic, "URMA", 4));
-    EXPECT_EQ(4u + 82u, urma::v2_wire::HELLO_PACKET_LEN);
+    EXPECT_EQ(4u + 90u, urma::v2_wire::HELLO_PACKET_LEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +117,9 @@ TEST(UrmaHandshakeTest, v3_protobuf_roundtrip) {
     urma::UrmaHello msg;
     msg.set_buffer_size(8192);
     msg.set_recv_buffer_cnt(127);
-    msg.set_jetty_id(0x12345678);
+    msg.set_jfr_id(0x12345678);
+    msg.set_socket_id(0x123456789abcdef0ULL);
+    msg.set_impl_version(2);
     uint8_t eid[16];
     for (int i = 0; i < 16; ++i) {
         eid[i] = static_cast<uint8_t>(i + 1);
@@ -127,7 +143,8 @@ TEST(UrmaHandshakeTest, v3_protobuf_roundtrip) {
     ASSERT_TRUE(msg2.ParseFromString(body));
     EXPECT_EQ(msg.buffer_size(), msg2.buffer_size());
     EXPECT_EQ(msg.recv_buffer_cnt(), msg2.recv_buffer_cnt());
-    EXPECT_EQ(msg.jetty_id(), msg2.jetty_id());
+    EXPECT_EQ(msg.jfr_id(), msg2.jfr_id());
+    EXPECT_EQ(msg.socket_id(), msg2.socket_id());
     EXPECT_EQ(16, msg2.eid().size());
     EXPECT_EQ(0, memcmp(msg.eid().data(), msg2.eid().data(), 16));
     EXPECT_EQ(msg.uasid(), msg2.uasid());
@@ -214,14 +231,14 @@ TEST(UrmaHandshakeTest, parsed_hello_segment_fields) {
     urma::ParsedHello p{};
     p.buffer_size = 8192;
     p.recv_buffer_cnt = 127;
-    p.jetty_id = 42;
+    p.jfr_id = 42;
     p.tp_type = 1;
     p.seg_va = 0x1000;
     p.seg_len = 0x100000;
     p.seg_token_id = 7;
     EXPECT_EQ(8192u, p.buffer_size);
     EXPECT_EQ(127u, p.recv_buffer_cnt);
-    EXPECT_EQ(42u, p.jetty_id);
+    EXPECT_EQ(42u, p.jfr_id);
     EXPECT_EQ(1u, p.tp_type);
     EXPECT_EQ(0x1000u, p.seg_va);
     EXPECT_EQ(0x100000u, p.seg_len);
@@ -232,22 +249,24 @@ TEST(UrmaHandshakeTest, rejects_invalid_resource_and_window_values) {
     urma::ParsedHello hello;
     hello.buffer_size = 8192;
     hello.recv_buffer_cnt = 127;
-    hello.jetty_id = 1;
+    hello.jfr_id = 1;
+    hello.socket_id = 123;
     hello.tp_type = URMA_CTP;
     hello.seg_va = 0x1000;
     hello.seg_len = 8192;
     EXPECT_TRUE(urma::ValidHello(hello));
 
-    hello.recv_buffer_cnt = 2;
+    hello.recv_buffer_cnt = 0;
     EXPECT_FALSE(urma::ValidHello(hello));
     hello.recv_buffer_cnt = 127;
     hello.seg_len = 0;
     EXPECT_FALSE(urma::ValidHello(hello));
     hello.seg_len = 8192;
-    hello.jetty_id = 0;
+    hello.jfr_id = 0;
     EXPECT_FALSE(urma::ValidHello(hello));
 
-    hello.jetty_id = 1;
+    hello.jfr_id = 1;
+    hello.socket_id = 123;
     hello.seg_va = std::numeric_limits<uint64_t>::max() - 7;
     hello.seg_len = 8;
     EXPECT_FALSE(urma::ValidHello(hello));
@@ -591,6 +610,649 @@ TEST_F(UrmaMockTest,
     urma_delete_jfce(sender_jfce);
     urma_delete_context(ctx);
     urma_free_device_list(devices);
+}
+
+// End-to-end software-provider tests. Each test uses a small pool without an
+// event adapter so completions can be delivered in a controlled order.
+class UrmaPooledTest : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        urma::g_skip_urma_init = false;
+        urma::FLAGS_urma_io_jfs_cnt = 2;
+        urma::FLAGS_urma_io_jfr_cnt = 1;
+        urma::FLAGS_urma_io_sq_depth = 16;
+        urma::FLAGS_urma_io_rx_depth = 8;
+        urma::FLAGS_urma_header_buf_count = 512;
+        GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_count", "2048");
+        GFLAGS_NAMESPACE::SetCommandLineOption("urma_use_polling", "false");
+        urma::GlobalUrmaInitializeOrDie();
+    }
+    void SetUp() override {
+        if (!urma::GetUrmaContext() ||
+            strcmp(urma::GetUrmaContext()->dev->name, "mock_urma_device")) {
+            GTEST_SKIP() << "Requires the URMA software provider";
+        }
+        _original = urma::g_urma_pool;
+        _pool.reset(new urma::UrmaResourcePool);
+        ASSERT_EQ(0, _pool->Initialize(urma::GetUrmaContext(), {}));
+        urma::g_urma_pool = _pool.get();
+    }
+    void TearDown() override {
+        for (auto& socket : _sockets) { socket->SetFailed(); }
+        _sockets.clear();
+        if (_pool) {
+            EXPECT_TRUE(_pool->Shutdown());
+            _pool.reset();
+            urma::g_urma_pool = _original;
+        }
+    }
+    urma::UrmaEndpoint* Endpoint() {
+        SocketOptions options;
+        options.socket_mode = SOCKET_MODE_URMA;
+        SocketId sid;
+        if (Socket::Create(options, &sid) != 0) { return nullptr; }
+        SocketUniquePtr socket;
+        if (Socket::Address(sid, &socket) != 0) { return nullptr; }
+        auto* ep = static_cast<UrmaTransport*>(socket->_transport.get())->GetUrmaEp();
+        if (ep->AllocateResources() != 0) { return nullptr; }
+        ep->_state = urma::UrmaEndpoint::S_ACK_WAIT;
+        _sockets.push_back(std::move(socket));
+        return ep;
+    }
+    void Connect(urma::UrmaEndpoint* from, urma::UrmaEndpoint* to) {
+        urma::ParsedHello hello;
+        to->MakeLocalParsedHello(&hello);
+        ASSERT_TRUE(urma::ValidHello(hello));
+        from->ApplyRemoteHello(hello);
+        ASSERT_EQ(0, from->ImportPeer(hello));
+    }
+    void DrainTx() {
+        for (auto* slot : _pool->io_jfs) {
+            urma_cr_t cr;
+            while (urma_poll_jfc(slot->jfc, 1, &cr) == 1) {
+                urma::UrmaEndpoint::HandleTxCompletion(slot, cr);
+            }
+        }
+    }
+    void DrainRx(bool reverse = false) {
+        for (auto* slot : _pool->io_jfr) {
+            std::vector<urma_cr_t> completions;
+            urma_cr_t cr;
+            while (urma_poll_jfc(slot->jfc, 1, &cr) == 1) { completions.push_back(cr); }
+            if (reverse) { std::reverse(completions.begin(), completions.end()); }
+            for (const auto& completion : completions) {
+                urma::UrmaEndpoint::HandleRxCompletion(slot, completion);
+            }
+        }
+    }
+    std::unique_ptr<urma::UrmaResourcePool> _pool;
+    urma::UrmaResourcePool* _original{nullptr};
+    std::vector<SocketUniquePtr> _sockets;
+};
+
+TEST_F(UrmaPooledTest, registered_header_pool_exhaustion_and_concurrency) {
+    auto memory = urma::CreateUrmaMemoryPool(urma::GetUrmaContext(), 64, 128);
+    ASSERT_TRUE(memory);
+    std::set<void*> addresses;
+    for (size_t i = 0; i < 128; ++i) {
+        void* p = memory->Allocate(64);
+        ASSERT_NE(nullptr, p);
+        EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(p) % 64);
+        EXPECT_TRUE(addresses.insert(p).second);
+        EXPECT_NE(nullptr, memory->SegmentFor(static_cast<char*>(p) + 63));
+    }
+    EXPECT_EQ(nullptr, memory->Allocate(64));
+    EXPECT_EQ(128u, memory->outstanding());
+    for (void* p : addresses) { memory->Deallocate(p); }
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&] {
+            for (int n = 0; n < 2000; ++n) {
+                void* p = memory->Allocate(64);
+                ASSERT_NE(nullptr, p);
+                std::memset(p, 42, 64);
+                memory->Deallocate(p);
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    EXPECT_EQ(0u, memory->outstanding());
+    EXPECT_EQ(nullptr, memory->Allocate(65));
+    EXPECT_TRUE(memory->Unregister());
+    EXPECT_EQ(nullptr, memory->Allocate(64));
+}
+
+TEST_F(UrmaPooledTest, independent_queues_and_import_cache) {
+    auto* a = Endpoint();
+    auto* b = Endpoint();
+    auto* c = Endpoint();
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+    ASSERT_NE(nullptr, c);
+    Connect(a, b);
+    Connect(c, b);
+    EXPECT_EQ(a->_conn_res->remote_jfr, c->_conn_res->remote_jfr);
+    EXPECT_EQ(1u, _pool->imports->size());
+    EXPECT_NE(_pool->io_jfs[0]->jfc, _pool->io_jfr[0]->jfc);
+    EXPECT_EQ(2u, _pool->io_jfr[0]->jfr->jfr_cfg.max_sge);
+    EXPECT_EQ(8u, _pool->io_jfr[0]->pending.size());
+    a->Reset();
+    EXPECT_EQ(1u, _pool->imports->size());
+    c->Reset();
+    EXPECT_EQ(0u, _pool->imports->size());
+    EXPECT_EQ(8u, _pool->io_jfr[0]->pending.size());
+}
+
+TEST_F(UrmaPooledTest, pooled_send_reorder_and_wrap_preserve_stream) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    sender->_next_send_seq = 65534;
+    receiver->_deliver_base = 65534;
+    butil::IOBuf data;
+    const std::string expected(20000, 'x');
+    data.append(expected);
+    const void* first_body = data.fetch1();
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(static_cast<ssize_t>(expected.size()), sender->CutFromIOBufList(input, 1));
+    EXPECT_TRUE(data.empty());
+    EXPECT_GT(_pool->io_jfs[0]->pending.size(), 0u);
+    EXPECT_GT(_pool->io_jfs[1]->pending.size(), 0u);
+    for (auto* slot : _pool->io_jfs) {
+        for (const auto* ctx : slot->pending) {
+            EXPECT_FALSE(ctx->send_data.empty());
+            EXPECT_EQ(urma::MSG_SMALL, ctx->header_buf->type);
+            EXPECT_EQ(receiver->_self_socket_id,
+                      butil::NetToHost64(ctx->header_buf->dst_socket_id));
+            if (ctx->seq == 65534) {
+#if BRPC_URMA_SINGLE_SGE
+                EXPECT_NE(first_body, ctx->send_data.fetch1());
+#else
+                EXPECT_EQ(first_body, ctx->send_data.fetch1());
+#endif
+            }
+        }
+    }
+    DrainRx(true);
+    EXPECT_EQ(expected, receiver->_input_processor.read_buf().to_string());
+    EXPECT_TRUE(receiver->_reorder_queue.empty());
+    EXPECT_LT(receiver->_deliver_base, 10u);
+    DrainTx();
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(0u, slot->sq_inflight.load());
+        EXPECT_TRUE(slot->pending.empty());
+    }
+}
+
+TEST_F(UrmaPooledTest, ctp_limits_total_wire_length_in_both_sge_modes) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    // Use a fresh contiguous block, so the split must come from the CTP
+    // wire limit rather than an existing IOBuf block boundary.
+    butil::IOBuf data;
+    {
+        butil::IOBufAsZeroCopyOutputStream stream(&data, 8192);
+        void* buffer = nullptr;
+        int size = 0;
+        ASSERT_TRUE(stream.Next(&buffer, &size));
+        ASSERT_GE(size, 4033);
+        memset(buffer, 'x', 4033);
+        stream.BackUp(size - 4033);
+    }
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(4033, sender->CutFromIOBufList(input, 1));
+    EXPECT_EQ(2u, sender->_next_send_seq);
+    auto* slot = _pool->io_jfr[0];
+    std::vector<uint32_t> lengths;
+    urma_cr_t cr;
+    while (urma_poll_jfc(slot->jfc, 1, &cr) == 1) {
+        lengths.push_back(cr.completion_len);
+        urma::UrmaEndpoint::HandleRxCompletion(slot, cr);
+    }
+    ASSERT_EQ(2u, lengths.size());
+    EXPECT_EQ(4096u, lengths[0]);
+    EXPECT_EQ(65u, lengths[1]);
+    EXPECT_EQ(std::string(4033, 'x'), receiver->_input_processor.read_buf().to_string());
+    DrainTx();
+}
+
+TEST_F(UrmaPooledTest, post_failure_preserves_caller_data_and_sequence) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    for (int i = 0; i < 8; ++i) {
+        butil::IOBuf data;
+        data.append("a");
+        butil::IOBuf* input[] = {&data};
+        ASSERT_EQ(1, sender->CutFromIOBufList(input, 1));
+    }
+    butil::IOBuf remaining;
+    remaining.append("after-failure");
+    butil::IOBuf* input[] = {&remaining};
+    EXPECT_EQ(-1, sender->CutFromIOBufList(input, 1));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ("after-failure", remaining.to_string());
+    EXPECT_EQ(8u, sender->_next_send_seq);
+    DrainRx();
+    DrainTx();
+    EXPECT_EQ(13, sender->CutFromIOBufList(input, 1));
+    DrainRx();
+    DrainTx();
+    EXPECT_EQ("aaaaaaaaafter-failure", receiver->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, disconnect_keeps_dma_and_imports_alive_until_completion) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    std::weak_ptr<urma::UrmaConnResource> resource = sender->_conn_res;
+    butil::IOBuf data;
+    data.append("in-flight");
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(9, sender->CutFromIOBufList(input, 1));
+    sender->Reset();
+    EXPECT_FALSE(resource.expired());
+    EXPECT_EQ(1u, _pool->imports->size());
+    _sockets[0]->SetFailed();
+    _sockets[1]->SetFailed();
+    DrainTx();
+    EXPECT_TRUE(resource.expired());
+    EXPECT_EQ(0u, _pool->imports->size());
+    DrainRx();
+    EXPECT_EQ(8u, _pool->io_jfr[0]->pending.size());
+}
+
+TEST_F(UrmaPooledTest, receive_errors_repost_and_reset_only_connection_state) {
+    auto* ep = Endpoint();
+    ASSERT_NE(nullptr, ep);
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(ep->_self_socket_id, &socket));
+    butil::IOBuf second;
+    second.append("second");
+    ep->ReorderAndDispatch(socket, 1, second);
+    EXPECT_EQ(1u, ep->_reorder_queue.size());
+    EXPECT_TRUE(ep->_input_processor.read_buf().empty());
+    ep->Reset();
+    EXPECT_TRUE(ep->_reorder_queue.empty());
+    EXPECT_EQ(0u, ep->_deliver_base);
+    EXPECT_EQ(0u, ep->_next_send_seq);
+    EXPECT_EQ(8u, _pool->io_jfr[0]->pending.size());
+}
+
+TEST_F(UrmaPooledTest, duplicate_sequence_fails_connection) {
+    auto* ep = Endpoint();
+    ASSERT_NE(nullptr, ep);
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(ep->_self_socket_id, &socket));
+    butil::IOBuf data;
+    data.append("a");
+    ep->ReorderAndDispatch(socket, 1, data);
+    ep->ReorderAndDispatch(socket, 1, data);
+    EXPECT_TRUE(socket->Failed());
+}
+
+TEST_F(UrmaPooledTest, concurrent_sq_reservations_do_not_exceed_depth) {
+    std::atomic<int> acquired{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; ++i) {
+        threads.emplace_back([&] {
+            while (_pool->AcquireJfs()) { acquired.fetch_add(1); }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    EXPECT_EQ(32, acquired.load());
+    EXPECT_FALSE(_pool->IsWritable());
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(slot->sq_depth, slot->sq_inflight.load());
+        slot->sq_inflight.store(0);
+    }
+}
+
+TEST_F(UrmaPooledTest, shutdown_reclaims_unpolled_contexts) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf data;
+    data.append("shutdown");
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(8, sender->CutFromIOBufList(input, 1));
+    sender->Reset();
+    receiver->Reset();
+    ASSERT_TRUE(_pool->Shutdown());
+    EXPECT_EQ(0u, _pool->imports->size());
+    for (auto* slot : _pool->io_jfs) { EXPECT_TRUE(slot->pending.empty()); }
+    for (auto* slot : _pool->io_jfr) { EXPECT_TRUE(slot->pending.empty()); }
+    EXPECT_TRUE(_pool->Shutdown());
+}
+
+TEST_F(UrmaPooledTest, initialization_failure_releases_preposted_buffers) {
+    auto free_headers = []() {
+        std::vector<void*> headers;
+        while (void* p = urma::AllocHeaderBuffer()) { headers.push_back(p); }
+        const size_t count = headers.size();
+        for (void* p : headers) { urma::FreeHeaderBuffer(p); }
+        return count;
+    };
+    const size_t before = free_headers();
+    {
+        urma::UrmaResourcePool failed;
+        urma::UrmaResourcePool::EventAdapter events;
+        events.attach = [](urma::UrmaIoSlot*) { errno = EMFILE; return -1; };
+        EXPECT_EQ(-1, failed.Initialize(urma::GetUrmaContext(), events));
+        EXPECT_LT(free_headers(), before);
+        EXPECT_TRUE(failed.Shutdown());
+    }
+    EXPECT_EQ(before, free_headers());
+}
+
+TEST_F(UrmaPooledTest, legacy_binary_hello_is_rejected_without_waiting_for_extension) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    auto* ep = Endpoint();
+    ASSERT_NE(nullptr, ep);
+    // No event consumer: ReadBodyAndNegotiate is driven directly by this test.
+    ep->_socket->_transport->_on_edge_trigger = nullptr;
+    ASSERT_EQ(0, ep->_socket->ResetFileDescriptor(fds[0]));
+    uint16_t prefix[3] = {butil::HostToNet16(86), butil::HostToNet16(2),
+                          butil::HostToNet16(1)};
+    ASSERT_EQ(sizeof(prefix), write(fds[1], prefix, sizeof(prefix)));
+    urma::ParsedHello hello;
+    bool negotiated = true;
+    EXPECT_EQ(-1, urma::ReadBodyAndNegotiate(ep, &hello, &negotiated));
+    EXPECT_EQ(EPROTO, errno);
+    EXPECT_FALSE(negotiated);
+    close(fds[1]);
+}
+
+TEST_F(UrmaPooledTest, failed_and_short_rx_completions_reclaim_and_repost) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    for (int i = 0; i < 2; ++i) {
+        butil::IOBuf data;
+        data.append("x");
+        butil::IOBuf* input[] = {&data};
+        ASSERT_EQ(1, sender->CutFromIOBufList(input, 1));
+    }
+    auto* slot = _pool->io_jfr[0];
+    urma_cr_t cr[2];
+    ASSERT_EQ(2, urma_poll_jfc(slot->jfc, 2, cr));
+    cr[0].status = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
+    cr[1].completion_len = 3;
+    urma::UrmaEndpoint::HandleRxCompletion(slot, cr[0]);
+    urma::UrmaEndpoint::HandleRxCompletion(slot, cr[1]);
+    EXPECT_EQ(8u, slot->pending.size());
+    EXPECT_TRUE(receiver->_input_processor.read_buf().empty());
+    DrainTx();
+}
+
+TEST_F(UrmaPooledTest, failed_tx_releases_context_and_fails_sender) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf data;
+    data.append("x");
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(1, sender->CutFromIOBufList(input, 1));
+    for (auto* slot : _pool->io_jfs) {
+        urma_cr_t cr;
+        if (urma_poll_jfc(slot->jfc, 1, &cr) == 1) {
+            cr.status = URMA_CR_RNR_RETRY_CNT_EXC_ERR;
+            urma::UrmaEndpoint::HandleTxCompletion(slot, cr);
+            EXPECT_EQ(0u, slot->sq_inflight.load());
+            EXPECT_TRUE(slot->pending.empty());
+        }
+    }
+    EXPECT_TRUE(_sockets[0]->Failed());
+    DrainRx();
+}
+
+TEST_F(UrmaPooledTest, import_cache_distinguishes_address_spaces) {
+    urma_rjfr_t remote{};
+    remote.jfr_id = _pool->io_jfr[0]->jfr->jfr_id;
+    remote.trans_mode = URMA_TM_RM;
+    remote.tp_type = URMA_CTP;
+    urma_token_t token{};
+    auto* a = _pool->imports->Acquire(urma::GetUrmaContext(), &remote, &token);
+    ++remote.jfr_id.uasid;
+    auto* b = _pool->imports->Acquire(urma::GetUrmaContext(), &remote, &token);
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+    EXPECT_NE(a, b);
+    EXPECT_EQ(2u, _pool->imports->size());
+    _pool->imports->Release(a);
+    _pool->imports->Release(b);
+    EXPECT_EQ(0u, _pool->imports->size());
+}
+
+class PooledEchoService : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* controller,
+              const test::EchoRequest* request, test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<Controller*>(controller);
+        response->set_message(request->message());
+        cntl->response_attachment().append(cntl->request_attachment());
+        done->Run();
+    }
+};
+
+TEST_F(UrmaPooledTest, event_driven_rpc_binary_and_protobuf_handshakes) {
+    // Use real epoll callbacks and the normal brpc handshake/message parser.
+    ASSERT_TRUE(_pool->Shutdown());
+    _pool.reset();
+    urma::g_urma_pool = _original;
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    PooledEchoService service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    for (int version : {2, 3}) {
+        urma::FLAGS_urma_client_handshake_version = version;
+        Channel channel;
+        ChannelOptions options;
+        options.socket_mode = SOCKET_MODE_URMA;
+        options.connection_type = "short";
+        options.timeout_ms = 3000;
+        options.max_retry = 0;
+        ASSERT_EQ(0, channel.Init(server.listen_address(), &options));
+        test::EchoService_Stub stub(&channel);
+        for (int n = 0; n < 4; ++n) {
+            test::EchoRequest request;
+            test::EchoResponse response;
+            request.set_message(std::string(12000 + n, char('a' + n)));
+            Controller cntl;
+            cntl.request_attachment().append(std::string(11000, 'z'));
+            stub.Echo(&cntl, &request, &response, nullptr);
+            ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+            EXPECT_EQ(request.message(), response.message());
+            EXPECT_EQ(cntl.request_attachment().to_string(),
+                      cntl.response_attachment().to_string());
+        }
+    }
+    server.Stop(0);
+    server.Join();
+}
+
+TEST_F(UrmaPooledTest, concurrent_pooled_and_short_handshakes_are_independent) {
+    ASSERT_TRUE(_pool->Shutdown());
+    _pool.reset();
+    urma::g_urma_pool = _original;
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    PooledEchoService service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    for (int version : {2, 3}) {
+        urma::FLAGS_urma_client_handshake_version = version;
+        for (const char* connection : {"pooled", "short"}) {
+            Channel channel;
+            ChannelOptions options;
+            options.socket_mode = SOCKET_MODE_URMA;
+            options.connection_type = connection;
+            options.timeout_ms = 3000;
+            options.max_retry = 0;
+            ASSERT_EQ(0, channel.Init(server.listen_address(), &options));
+            std::atomic<int> ready{0};
+            std::vector<std::thread> workers;
+            for (int i = 0; i < 4; ++i) {
+                workers.emplace_back([&, i] {
+                    ++ready;
+                    while (ready.load() != 4) { std::this_thread::yield(); }
+                    test::EchoService_Stub stub(&channel);
+                    for (int n = 0; n < 4; ++n) {
+                        test::EchoRequest request;
+                        test::EchoResponse response;
+                        request.set_message(std::string(100 + n, char('a' + i)));
+                        Controller cntl;
+                        stub.Echo(&cntl, &request, &response, nullptr);
+                        EXPECT_FALSE(cntl.Failed()) << connection << ": " << cntl.ErrorText();
+                        EXPECT_EQ(request.message(), response.message());
+                    }
+                });
+            }
+            for (auto& worker : workers) { worker.join(); }
+        }
+    }
+    server.Stop(0);
+    server.Join();
+}
+
+class BlockingPooledService : public test::EchoService {
+public:
+    std::atomic<bool> entered{false};
+    std::atomic<bool> released{false};
+    void Echo(google::protobuf::RpcController* controller,
+              const test::EchoRequest* request, test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        if (request->message() == "wait") {
+            entered = true;
+            const int64_t deadline = butil::monotonic_time_us() + 2000000;
+            while (!released && butil::monotonic_time_us() < deadline) {
+                bthread_usleep(1000);
+            }
+            if (!released) { controller->SetFailed("Shared receive CQ was blocked"); }
+        } else if (request->message() == "release") {
+            released = true;
+        }
+        response->set_message(request->message());
+        done->Run();
+    }
+};
+
+TEST_F(UrmaPooledTest, blocking_callback_does_not_block_another_connection_on_same_jfr) {
+    ASSERT_TRUE(_pool->Shutdown());
+    _pool.reset();
+    urma::g_urma_pool = _original;
+    ASSERT_EQ(1u, _original->io_jfr.size());
+    BlockingPooledService service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    Channel first, second;
+    ChannelOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.timeout_ms = 3000;
+    options.max_retry = 0;
+    options.connection_group = "blocking-first";
+    ASSERT_EQ(0, first.Init(server.listen_address(), &options));
+    options.connection_group = "blocking-second";
+    ASSERT_EQ(0, second.Init(server.listen_address(), &options));
+    std::thread worker([&] {
+        test::EchoService_Stub stub(&first);
+        test::EchoRequest request;
+        test::EchoResponse response;
+        Controller cntl;
+        request.set_message("wait");
+        stub.Echo(&cntl, &request, &response, nullptr);
+        EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    });
+    const int64_t deadline = butil::monotonic_time_us() + 3000000;
+    while (!service.entered && butil::monotonic_time_us() < deadline) { usleep(1000); }
+    EXPECT_TRUE(service.entered);
+    test::EchoService_Stub stub(&second);
+    test::EchoRequest request;
+    test::EchoResponse response;
+    Controller cntl;
+    request.set_message("release");
+    stub.Echo(&cntl, &request, &response, nullptr);
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    worker.join();
+    server.Stop(0);
+    server.Join();
+}
+
+TEST_F(UrmaPooledTest, disconnected_connections_release_server_sockets_and_imports) {
+    ASSERT_TRUE(_pool->Shutdown());
+    _pool.reset();
+    urma::g_urma_pool = _original;
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    GFLAGS_NAMESPACE::SetCommandLineOption("defer_close_second", "0");
+    PooledEchoService service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    // Version 0 exercises the serialized TCP-fallback reader as well.
+    for (int version : {0, 2, 3}) {
+        urma::FLAGS_urma_client_handshake_version = version;
+        for (int cycle = 0; cycle < 3; ++cycle) {
+            std::vector<std::unique_ptr<Channel>> channels;
+            for (int i = 0; i < 64; ++i) {
+                std::unique_ptr<Channel> channel(new Channel);
+                ChannelOptions options;
+                options.connection_group = "close-test-" + std::to_string(i);
+                options.socket_mode = version == 0 ? SOCKET_MODE_TCP : SOCKET_MODE_URMA;
+                options.timeout_ms = 3000;
+                options.max_retry = 0;
+                ASSERT_EQ(0, channel->Init(server.listen_address(), &options));
+                test::EchoService_Stub stub(channel.get());
+                test::EchoRequest request;
+                test::EchoResponse response;
+                request.set_message("persistent connection close/reopen");
+                Controller cntl;
+                stub.Echo(&cntl, &request, &response, nullptr);
+                ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+                channels.emplace_back(std::move(channel));
+            }
+            ServerStatistics stat;
+            server.GetStat(&stat);
+            ASSERT_EQ(64u, stat.connection_count);
+            channels.clear();
+            const int64_t deadline = butil::monotonic_time_us() + 3000000;
+            do {
+                usleep(1000);
+                server.GetStat(&stat);
+            } while ((stat.connection_count || _original->imports->size()) &&
+                     butil::monotonic_time_us() < deadline);
+            EXPECT_EQ(0u, stat.connection_count);
+            EXPECT_EQ(0u, _original->imports->size());
+        }
+    }
+    server.Stop(0);
+    server.Join();
 }
 
 #else  // BRPC_WITH_URMA
