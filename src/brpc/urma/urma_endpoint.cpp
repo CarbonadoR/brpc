@@ -19,7 +19,6 @@
 
 #if BRPC_WITH_URMA
 
-#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,7 +27,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -47,26 +45,20 @@
 
 #include "brpc/input_messenger.h"
 #include "brpc/socket.h"
-#include "brpc/urma/urma_bonding.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
 #include "brpc/urma_transport.h"
 
-DECLARE_int32(task_group_ntags);
 
 namespace brpc {
 namespace urma {
 
 // Flags used here are declared in urma_endpoint.h (urma_use_polling,
 // urma_poller_num, urma_disable_bthread). Declare the rest here.
-DECLARE_int32(urma_sq_size);
-DECLARE_int32(urma_rq_size);
 DECLARE_int32(urma_cqe_poll_once);
 DECLARE_bool(urma_recv_zerocopy);
 DECLARE_int32(urma_zerocopy_min_size);
-DECLARE_int32(urma_prepared_jetty_cnt);
-DECLARE_bool(urma_poller_yield);
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -74,84 +66,7 @@ static const size_t HELLO_ACK_LEN = 4;
 static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
 
-// ---- Globals: prepared jetty pool + poller groups ----
-struct PreparedJetty {
-    UrmaResource* res;
-};
-static butil::Mutex g_prepared_mutex;
-static UrmaResource* g_prepared_list = nullptr;  // singly-linked
-static int g_prepared_cnt = 0;
-
-static int PreparedJettyCount() {
-    const int requested =
-        std::max(0, std::min(FLAGS_urma_prepared_jetty_cnt, 1024));
-    if (requested == 0) {
-        return 0;
-    }
-
-    struct rlimit nofile;
-    if (getrlimit(RLIMIT_NOFILE, &nofile) != 0 ||
-        nofile.rlim_cur == RLIM_INFINITY) {
-        return requested;
-    }
-
-    // In event mode each prepared JFCE consumes a file descriptor. Keep room
-    // for one TCP fd per future URMA connection and for brpc/system internals.
-    static const rlim_t kReservedFdCount = 64;
-    const rlim_t max_prepared =
-        nofile.rlim_cur > kReservedFdCount
-            ? (nofile.rlim_cur - kReservedFdCount) / 2
-            : 0;
-    if (max_prepared >= static_cast<rlim_t>(requested)) {
-        return requested;
-    }
-
-    LOG(WARNING) << "Cap URMA prepared jetty count from " << requested
-                 << " to " << max_prepared
-                 << " due to RLIMIT_NOFILE=" << nofile.rlim_cur;
-    return static_cast<int>(max_prepared);
-}
-
-std::vector<UrmaEndpoint::PollerGroup> UrmaEndpoint::_poller_groups;
-
-// ============================================================================
-// UrmaResource lifecycle.
-// ============================================================================
-
-UrmaResource::~UrmaResource() {
-    if (remote_jetty) {
-        urma_unimport_jetty(remote_jetty);
-    }
-    if (remote_seg) {
-        urma_unimport_seg(remote_seg);
-    }
-    if (jetty) {
-        urma_delete_jetty(jetty);
-    }
-    if (jfr) {
-        urma_delete_jfr(jfr);
-    }
-    if (jfc) {
-        urma_delete_jfc(jfc);
-    }
-    if (jfce) {
-        urma_delete_jfce(jfce);
-    }
-}
-
-// ============================================================================
-// Constructor / destructor / Reset.
-// ============================================================================
-
-UrmaEndpoint::UrmaEndpoint(Socket* s)
-    : _socket(s),
-      _state(UNINIT),
-      _handshake_version(0),
-      _resource(nullptr) {
-    _sq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
-    _rq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_rq_size))));
+UrmaEndpoint::UrmaEndpoint(Socket* s) : _socket(s) {
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
     _input_processor.Init(s, InputMessengerProcessor::STREAM_URMA_JETTY);
@@ -170,20 +85,8 @@ void UrmaEndpoint::Reset() {
     _state = UNINIT;
     _handshake_version = 0;
     _remote_recv_block_size = 0;
-    _local_window_capacity = 0;
-    _remote_window_capacity = 0;
-    _remote_rq_window_size.store(0, butil::memory_order_relaxed);
-    _sq_window_size.store(0, butil::memory_order_relaxed);
-    _new_rq_wrs.store(0, butil::memory_order_relaxed);
-    _sq_imm_window_size = 0;
-    _sq_current = 0;
-    _sq_sent = 0;
-    _rq_received = 0;
-    _pending_received_bytes.store(0, butil::memory_order_relaxed);
-    _input_processor.Reset();
-    _sbuf.clear();
-    _rbuf.clear();
-    _rbuf_data.clear();
+    _self_socket_id = INVALID_SOCKET_ID;
+    _peer_socket_id = INVALID_SOCKET_ID;
     _read_butex->store(0, butil::memory_order_relaxed);
 }
 
@@ -387,156 +290,29 @@ int UrmaEndpoint::ReadAndParseHelloV3(ParsedHello* out, bool* negotiated) {
 // ============================================================================
 
 int UrmaEndpoint::AllocateResources() {
-    if (_resource) {
-        return 0;
-    }
-    urma_context_t* ctx = GetUrmaContext();
-    if (!ctx) {
+    if (_conn_res) { return 0; }
+    if (!g_urma_pool || g_urma_pool->io_jfr.empty()) {
         errno = ENODEV;
         return -1;
     }
-
-    _resource = new (std::nothrow) UrmaResource();
-    if (!_resource) {
-        return -1;
-    }
-
-    // Try the prepared pool first (sized sq/rq match).
-    if (_sq_size <= static_cast<uint16_t>(FLAGS_urma_sq_size) &&
-        _rq_size <= static_cast<uint16_t>(FLAGS_urma_rq_size)) {
-        BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        if (g_prepared_list) {
-            UrmaResource* next = g_prepared_list->next;
-            delete _resource;
-            _resource = g_prepared_list;
-            g_prepared_list = next;
-            _resource->next = nullptr;
-            --g_prepared_cnt;
-        }
-    }
-
-    if (!_resource->jfc) {
-        // The SDK requires every JFC to reference a JFCE. Polling mode does
-        // not arm or consume it, but still supplies the required object.
-        _resource->jfce = urma_create_jfce(ctx);
-        if (!_resource->jfce ||
-            (!FLAGS_urma_use_polling && _resource->jfce->fd < 0)) {
-            LOG(ERROR) << "Fail to create a usable URMA JFCE";
-            errno = ENODEV;
-            return -1;
-        }
-
-        urma_jfc_cfg_t jfc_cfg{};
-        jfc_cfg.depth = static_cast<uint32_t>(_sq_size + _rq_size);
-        jfc_cfg.jfce = _resource->jfce;
-        _resource->jfc = urma_create_jfc(ctx, &jfc_cfg);
-        if (!_resource->jfc) {
-            PLOG(ERROR) << "urma_create_jfc";
-            return -1;
-        }
-
-        urma_jfr_cfg_t jfr_cfg{};
-        jfr_cfg.depth = static_cast<uint32_t>(_rq_size);
-        jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
-        jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-        jfr_cfg.jfc = _resource->jfc;
-        _resource->jfr = urma_create_jfr(ctx, &jfr_cfg);
-        if (!_resource->jfr) {
-            PLOG(ERROR) << "urma_create_jfr";
-            return -1;
-        }
-
-        urma_jetty_cfg_t jetty_cfg{};
-        jetty_cfg.flag.bs.share_jfr = 1;
-        jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(_sq_size);
-        jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-        jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
-        jetty_cfg.jfs_cfg.max_sge =
-            static_cast<uint8_t>(GetUrmaMaxSge());
-        jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-        jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-        jetty_cfg.jfs_cfg.jfc = _resource->jfc;
-        jetty_cfg.shared.jfr = _resource->jfr;
-        jetty_cfg.shared.jfc = _resource->jfc;
-        _resource->jetty = urma_create_jetty(ctx, &jetty_cfg);
-        if (!_resource->jetty) {
-            PLOG(ERROR) << "urma_create_jetty";
-            return -1;
-        }
-    }
-
-    _sbuf.resize(_sq_size - RESERVED_WR_NUM);
-    _rbuf.resize(_rq_size);
-    _rbuf_data.resize(_rq_size, nullptr);
-
-    // Wrap the JFCE fd in a brpc Socket so PollCq is driven by epoll.
-    if (!FLAGS_urma_use_polling) {
-        if (!_resource->jfce || _resource->jfce->fd < 0) {
-            LOG(ERROR) << "Prepared URMA resource has no usable JFCE";
-            errno = ENODEV;
-            return -1;
-        }
-        if (ReqNotifyCq() != 0) {
-            return -1;
-        }
-        SocketOptions options;
-        options.user = this;
-        options.keytable_pool = _socket->keytable_pool();
-        options.fd = _resource->jfce->fd;
-        options.on_edge_triggered_events = PollCq;
-        if (Socket::Create(options, &_cq_sid) < 0) {
-            PLOG(ERROR) << "Fail to create CQ socket";
-            return -1;
-        }
-    } else {
-        // Polling mode: synthetic carrier socket (no fd).
-        SocketOptions options;
-        options.user = this;
-        options.keytable_pool = _socket->keytable_pool();
-        options.on_edge_triggered_events = PollCq;
-        if (Socket::Create(options, &_cq_sid) < 0) {
-            PLOG(ERROR) << "Fail to create CQ socket (polling)";
-            return -1;
-        }
-        PollerAddCqSid();
-    }
+    _conn_res.reset(new UrmaConnResource);
+    _conn_res->local_jfr_index = g_urma_pool->PickJfr();
+    _conn_res->imports = g_urma_pool->imports;
+    _self_socket_id = _socket->id();
     return 0;
 }
 
 void UrmaEndpoint::DeallocateResources() {
-    if (!_resource) {
-        return;
-    }
-
-    if (FLAGS_urma_use_polling) {
-        PollerRemoveCqSid();
-    }
-
-    // Tear down the CQ socket so the EventDispatcher stops calling PollCq.
-    if (_cq_sid != INVALID_SOCKET_ID) {
-        SocketUniquePtr s;
-        if (Socket::Address(_cq_sid, &s) == 0) {
-            if (s->fd() >= 0) {
-                s->_io_event.RemoveConsumer(s->_fd);
-            }
-            s->_user = nullptr;  // Do not release user (this UrmaEndpoint).
-            s->_fd = -1;  // Already removed fd from epoll.
-            s->SetFailed();
-        }
-        _cq_sid = INVALID_SOCKET_ID;
-    }
-
-    // Reusing a Jetty requires a driver-supported RESET plus a complete JFC
-    // drain. Until that lifecycle is implemented, prepared resources are
-    // one-shot: they accelerate connection setup but are destroyed on close.
-    delete _resource;
-    _resource = nullptr;
+    BAIDU_SCOPED_LOCK(_reorder_mutex);
+    BAIDU_SCOPED_LOCK(_dispatch_mutex);
+    // In-flight TxCompletionCtx objects retain their own connection reference.
+    _conn_res.reset();
+    _reorder_queue.clear();
+    _deliver_base = 0;
+    _next_send_seq = 0;
+    _pending_received_bytes.store(0, butil::memory_order_relaxed);
+    _input_processor.Reset();
 }
-
-// ============================================================================
-// ImportPeer: the critical import_seg-before-import_jetty sequence.
-// ============================================================================
 
 int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
     urma_context_t* ctx = GetUrmaContext();
@@ -1079,6 +855,36 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
                                        received_us, base_realtime, last_msg);
 }
 
+int UrmaEndpoint::AttachSlotSocket(UrmaIoSlot* slot) {
+    // First create a carrier without a user or fd. A failed Socket::Create
+    // may invoke BeforeRecycle, so transfer slot ownership only after success.
+    SocketOptions options;
+    options.on_edge_triggered_events = PollIoJfc;
+    if (Socket::Create(options, &slot->jfc_sid) != 0) { return -1; }
+    SocketUniquePtr socket;
+    if (Socket::Address(slot->jfc_sid, &socket) != 0) { return -1; }
+    slot->AddRef();
+    socket->_user = slot;
+    // Keep liburma's fd ownership independent of the carrier's lifetime.
+    const int fd = dup(slot->jfce->fd);
+    if (fd < 0 || socket->ResetFileDescriptor(fd) != 0) {
+        if (fd >= 0) { close(fd); }
+        socket->SetFailed();
+        slot->jfc_sid = INVALID_SOCKET_ID;
+        return -1;
+    }
+    return 0;
+}
+void UrmaEndpoint::DetachSlotSocket(UrmaIoSlot* slot) {
+    if (slot->jfc_sid == INVALID_SOCKET_ID) { return; }
+    SocketUniquePtr socket;
+    if (Socket::Address(slot->jfc_sid, &socket) == 0) {
+        if (socket->_fd >= 0) { socket->_io_event.RemoveConsumer(socket->_fd); }
+        // Socket closes its duplicate; the provider owns the original fd.
+        socket->SetFailed();
+    }
+    slot->jfc_sid = INVALID_SOCKET_ID;
+}
 void UrmaEndpoint::PollCq(Socket* m) {
     auto* ep = static_cast<UrmaEndpoint*>(m->user());
     if (!ep || !ep->_resource || !ep->_resource->jfc) {
@@ -1610,236 +1416,31 @@ int UrmaEndpoint::ReqNotifyCq() {
     return 0;
 }
 
-int UrmaEndpoint::PollingModeInitialize(
-        bthread_tag_t tag, std::function<void()> callback,
-        std::function<void()> init_fn, std::function<void()> release_fn) {
-    if (!FLAGS_urma_use_polling) {
-        return 0;
-    }
-    if (tag >= _poller_groups.size() ||
-        _poller_groups[tag].pollers.empty()) {
-        errno = EINVAL;
-        return -1;
-    }
-    auto& group = _poller_groups[tag];
-    bool expected = false;
-    if (!group.running.compare_exchange_strong(expected, true)) {
-        return 0;
-    }
-    struct FnArgs {
-        Poller* poller;
-        butil::atomic<bool>* running;
-    };
-    auto fn = [](void* p) -> void* {
-        std::unique_ptr<FnArgs> args(static_cast<FnArgs*>(p));
-        Poller* poller = args->poller;
-        butil::atomic<bool>* running = args->running;
-        std::unordered_set<SocketId> cq_sids;
-        CqSidOp op;
-
-        if (poller->init_fn) {
-            poller->init_fn();
-        }
-        while (running->load(butil::memory_order_relaxed)) {
-            while (poller->op_queue.Dequeue(op)) {
-                if (op.type == CqSidOp::ADD) {
-                    cq_sids.emplace(op.sid);
-                } else {
-                    cq_sids.erase(op.sid);
-                }
-            }
-            for (SocketId sid : cq_sids) {
-                SocketUniquePtr s;
-                if (Socket::Address(sid, &s) == 0) {
-                    PollCq(s.get());
-                }
-            }
-            if (poller->callback) {
-                poller->callback();
-            }
-            if (FLAGS_urma_poller_yield || cq_sids.empty()) {
-                bthread_yield();
-            }
-        }
-        if (poller->release_fn) {
-            poller->release_fn();
-        }
-        return nullptr;
-    };
-
-    auto& pollers = group.pollers;
-    for (size_t i = 0; i < pollers.size(); ++i) {
-        pollers[i].callback = callback;
-        pollers[i].init_fn = init_fn;
-        pollers[i].release_fn = release_fn;
-        std::unique_ptr<FnArgs> args(new (std::nothrow)
-                                        FnArgs{&pollers[i], &group.running});
-        if (!args) {
-            group.running.store(false, butil::memory_order_relaxed);
-            for (size_t j = 0; j < i; ++j) {
-                bthread_join(pollers[j].tid, nullptr);
-                pollers[j].tid = INVALID_BTHREAD;
-            }
-            errno = ENOMEM;
-            return -1;
-        }
-        bthread_attr_t attr = FLAGS_urma_disable_bthread
-                                  ? BTHREAD_ATTR_PTHREAD
-                                  : BTHREAD_ATTR_NORMAL;
-        attr.tag = tag;
-        bthread_attr_set_name(&attr, "UrmaPolling");
-        const int rc = bthread_start_background(
-            &pollers[i].tid, &attr, fn, args.get());
-        if (rc != 0) {
-            group.running.store(false, butil::memory_order_relaxed);
-            for (size_t j = 0; j < i; ++j) {
-                bthread_join(pollers[j].tid, nullptr);
-                pollers[j].tid = INVALID_BTHREAD;
-            }
-            errno = rc;
-            return -1;
-        }
-        args.release();
-    }
+int UrmaEndpoint::PollingModeInitialize(bthread_tag_t,
+        std::function<void()>, std::function<void()>, std::function<void()>) {
+    if (FLAGS_urma_use_polling) { errno = ENOTSUP; return -1; }
     return 0;
 }
-
-void UrmaEndpoint::PollingModeRelease(bthread_tag_t tag) {
-    if (!FLAGS_urma_use_polling || tag >= _poller_groups.size()) {
-        return;
-    }
-    auto& group = _poller_groups[tag];
-    group.running.store(false, butil::memory_order_relaxed);
-    for (auto& poller : group.pollers) {
-        if (poller.tid != INVALID_BTHREAD) {
-            bthread_join(poller.tid, nullptr);
-            poller.tid = INVALID_BTHREAD;
-        }
-    }
-}
-
-void UrmaEndpoint::PollerAddCqSid() {
-    if (_cq_sid == INVALID_SOCKET_ID || _poller_groups.empty()) {
-        return;
-    }
-    _poller_tag = bthread_self_tag();
-    if (_poller_tag >= _poller_groups.size()) {
-        return;
-    }
-    auto& pollers = _poller_groups[_poller_tag].pollers;
-    if (pollers.empty()) {
-        return;
-    }
-    const size_t index =
-        butil::fmix32(_cq_sid) % pollers.size();
-    pollers[index].op_queue.Enqueue(
-        CqSidOp{CqSidOp::ADD, _cq_sid});
-}
-
-void UrmaEndpoint::PollerRemoveCqSid() {
-    if (_cq_sid == INVALID_SOCKET_ID || _poller_groups.empty() ||
-        _poller_tag >= _poller_groups.size()) {
-        return;
-    }
-    auto& pollers = _poller_groups[_poller_tag].pollers;
-    if (pollers.empty()) {
-        return;
-    }
-    const size_t index =
-        butil::fmix32(_cq_sid) % pollers.size();
-    pollers[index].op_queue.Enqueue(
-        CqSidOp{CqSidOp::REMOVE, _cq_sid});
-}
+void UrmaEndpoint::PollingModeRelease(bthread_tag_t) {}
 
 int UrmaEndpoint::GlobalInitialize() {
-    // Pre-allocate the prepared jetty pool. Skipped if URMA init is skipped
-    // (unit-test mode).
-    if (FLAGS_urma_use_polling && _poller_groups.empty()) {
-        if (FLAGS_urma_poller_num <= 0) {
-            LOG(ERROR) << "urma_poller_num must be positive";
-            errno = EINVAL;
-            return -1;
-        }
-        size_t ntags = static_cast<size_t>(FLAGS_task_group_ntags);
-        if (ntags == 0) {
-            ntags = 1;
-        }
-        _poller_groups = std::vector<PollerGroup>(ntags);
+    if (g_urma_pool) { return 0; }
+    if (!GetUrmaContext()) { return 0; }
+    if (FLAGS_urma_use_polling || IsUrmaBondingDevice()) {
+        errno = ENOTSUP;
+        return -1;
     }
-    if (g_prepared_cnt > 0) {
-        return 0;
-    }
-    urma_context_t* ctx = GetUrmaContext();
-    if (!ctx) {
-        return 0;
-    }
-    const int prepared_jetty_count = PreparedJettyCount();
-    for (int i = 0; i < prepared_jetty_count; ++i) {
-        auto* r = new (std::nothrow) UrmaResource();
-        if (!r) {
-            break;
-        }
-        r->jfce = urma_create_jfce(ctx);
-        if (!r->jfce ||
-            (!FLAGS_urma_use_polling && r->jfce->fd < 0)) {
-            delete r;
-            break;
-        }
-        urma_jfc_cfg_t jfc_cfg{};
-        jfc_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size + FLAGS_urma_rq_size);
-        jfc_cfg.jfce = r->jfce;
-        r->jfc = urma_create_jfc(ctx, &jfc_cfg);
-        if (!r->jfc) {
-            delete r;
-            break;
-        }
-        urma_jfr_cfg_t jfr_cfg{};
-        jfr_cfg.depth = static_cast<uint32_t>(FLAGS_urma_rq_size);
-        jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
-        jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-        jfr_cfg.jfc = r->jfc;
-        r->jfr = urma_create_jfr(ctx, &jfr_cfg);
-        if (!r->jfr) {
-            delete r;
-            break;
-        }
-        urma_jetty_cfg_t jetty_cfg{};
-        jetty_cfg.flag.bs.share_jfr = 1;
-        jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size);
-        jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-        jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
-        jetty_cfg.jfs_cfg.max_sge =
-            static_cast<uint8_t>(GetUrmaMaxSge());
-        jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-        jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-        jetty_cfg.jfs_cfg.jfc = r->jfc;
-        jetty_cfg.shared.jfr = r->jfr;
-        jetty_cfg.shared.jfc = r->jfc;
-        r->jetty = urma_create_jetty(ctx, &jetty_cfg);
-        if (!r->jetty) {
-            delete r;
-            break;
-        }
-        r->next = g_prepared_list;
-        g_prepared_list = r;
-        ++g_prepared_cnt;
-    }
-    return 0;
+    g_urma_pool = CreateUrmaResourcePool();
+    if (!g_urma_pool) { errno = ENOMEM; return -1; }
+    UrmaResourcePool::EventAdapter events;
+    events.attach = AttachSlotSocket;
+    events.detach = DetachSlotSocket;
+    return g_urma_pool->Initialize(GetUrmaContext(), events);
 }
-
 void UrmaEndpoint::GlobalRelease() {
-    {
-        BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        while (g_prepared_list) {
-            UrmaResource* next = g_prepared_list->next;
-            delete g_prepared_list;
-            g_prepared_list = next;
-        }
-        g_prepared_cnt = 0;
-    }
-    for (size_t tag = 0; tag < _poller_groups.size(); ++tag) {
-        PollingModeRelease(static_cast<bthread_tag_t>(tag));
+    if (g_urma_pool && g_urma_pool->Shutdown()) {
+        delete g_urma_pool;
+        g_urma_pool = nullptr;
     }
 }
 

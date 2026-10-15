@@ -22,9 +22,9 @@
 #include <functional>
 #include <ostream>
 #include <vector>
+#include <memory>
 
 #include "butil/atomicops.h"
-#include "butil/containers/mpsc_queue.h"
 #include "butil/iobuf.h"
 #include "butil/macros.h"
 #include "butil/synchronization/lock.h"
@@ -37,6 +37,7 @@
 #include "urma_api.h"
 #include "urma_types.h"
 #include "brpc/urma/urma_handshake.h"
+#include "brpc/urma/urma_resource_pool.h"
 #include "brpc/urma/urma_handshake.pb.h"
 
 namespace brpc {
@@ -75,30 +76,7 @@ private:
     int _error{0};
 };
 
-// POD holder for the URMA kernel objects backing one connection:
-//   - the send jetty (JFS), shared-JFR jetty, JFR, JFC, and (event mode) JFCE
-//   - the imported peer jetty and peer segment
-// Mirrors the role of rdma::RdmaResource, but the URMA object graph is a
-// little different (no separate QP/CQ split).
-struct UrmaResource {
-    UrmaResource* next{nullptr};  // singly-linked list for the prepared pool
-
-    urma_jfc_t* jfc{nullptr};
-    urma_jfce_t* jfce{nullptr};   // event mode only; null in polling mode
-    urma_jfr_t* jfr{nullptr};
-    urma_jetty_t* jetty{nullptr};
-    // Imported peer objects (created per-connection, not pooled).
-    urma_target_jetty_t* remote_jetty{nullptr};
-    urma_target_seg_t* remote_seg{nullptr};
-
-    UrmaResource() = default;
-    ~UrmaResource();
-    DISALLOW_COPY_AND_ASSIGN(UrmaResource);
-};
-
-// One per Socket. Carries the handshake state machine, the send/recv
-// windows, and the registered buffer bookkeeping. Cache-line padded to avoid
-// false sharing between connections.
+// One protocol endpoint per Socket; hardware queues belong to the global pool.
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
     friend class UrmaConnect;
     friend class Socket;
@@ -115,7 +93,7 @@ public:
     ~UrmaEndpoint() override;
 
     // ---- Global initialization / release ----
-    // Pre-allocate the prepared Jetty pool. Called once at GlobalUrmaInitializeOrDie.
+    // Create the process-wide JFS/JFR pool. Called once at GlobalUrmaInitializeOrDie.
     static int GlobalInitialize();
     static void GlobalRelease();
 
@@ -151,7 +129,12 @@ public:
     // callback again.
     static void PollCq(Socket* m);
 
-    // Initialize the per-tag polling infrastructure (polling mode).
+    // Event adapter for shared queue slots.
+    static void PollIoJfc(Socket*);
+    static int AttachSlotSocket(UrmaIoSlot*);
+    static void DetachSlotSocket(UrmaIoSlot*);
+
+    // Compatibility entry points; polling mode currently returns ENOTSUP.
     static int PollingModeInitialize(bthread_tag_t tag,
                                      std::function<void()> callback,
                                      std::function<void()> init_fn,
@@ -207,8 +190,7 @@ private:
     static void* ProcessHandshakeAtClient(void* arg);
     static void* ProcessHandshakeAtServer(void* arg);
 
-    // Allocate / deallocate the per-connection URMA resources (JFCE/JFC/JFR/
-    // Jetty, plus the CQ socket). Returns 0 on success.
+    // Allocate only connection metadata; shared queues survive disconnect.
     int AllocateResources();
     void DeallocateResources();
 
@@ -255,9 +237,6 @@ private:
     // Request completion notification (event mode only).
     int ReqNotifyCq();
 
-    // Add/remove the CQ socket id to/from the poller (polling mode only).
-    void PollerAddCqSid();
-    void PollerRemoveCqSid();
 
     inline void TryReadOnTcp();
     void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
@@ -278,12 +257,7 @@ private:
     butil::atomic<int64_t> _pending_received_bytes{0};
     butil::Mutex _dispatch_mutex;
 
-    // The URMA resources (jetty / jfc / jfr / jfce / imported peer objects).
-    UrmaResource* _resource{nullptr};
-
-    // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
-    // (polling mode). PollCq is the edge-triggered callback on this socket.
-    SocketId _cq_sid{INVALID_SOCKET_ID};
+    std::shared_ptr<UrmaConnResource> _conn_res;
 
     // ---- Send / recv window bookkeeping ----
     uint16_t _sq_size{0};   // local JFS depth
@@ -321,25 +295,6 @@ private:
     // Reserved WR slots for pure-ack IMM WRs.
     static constexpr uint16_t RESERVED_WR_NUM = 3;
 
-    // Cq socket id operation (polling mode registration queue).
-    struct CqSidOp {
-        enum OpType { ADD, REMOVE } type;
-        SocketId sid;
-    };
-    struct BAIDU_CACHELINE_ALIGNMENT Poller {
-        bthread_t tid{INVALID_BTHREAD};
-        butil::MPSCQueue<CqSidOp, butil::ObjectPoolAllocator<CqSidOp>> op_queue;
-        std::function<void()> callback;
-        std::function<void()> init_fn;
-        std::function<void()> release_fn;
-    };
-    struct BAIDU_CACHELINE_ALIGNMENT PollerGroup {
-        PollerGroup() : pollers(FLAGS_urma_poller_num), running(false) {}
-        std::vector<Poller> pollers;
-        butil::atomic<bool> running;
-    };
-    static std::vector<PollerGroup> _poller_groups;
-    bthread_tag_t _poller_tag{0};
 
     DISALLOW_COPY_AND_ASSIGN(UrmaEndpoint);
 };
