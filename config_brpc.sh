@@ -544,6 +544,15 @@ if [ $WITH_RDMA != 0 ]; then
 fi
 
 if [ $WITH_URMA != 0 ]; then
+    if [ $WITH_ASAN != 0 ]; then
+        >&2 $ECHO "Pooled URMA requires tcmalloc, which is incompatible with ASAN"
+        exit 1
+    fi
+    URMA_TCMALLOC_LIB=$(find_dir_of_lib_or_die tcmalloc) || exit 1
+    URMA_TCMALLOC_HDR=$(find_dir_of_header_or_die gperftools/tcmalloc.h) || exit 1
+    append_to_output_libs "$URMA_TCMALLOC_LIB"
+    append_to_output_headers "$URMA_TCMALLOC_HDR"
+    append_to_output "DYNAMIC_LINKINGS+=-ltcmalloc"
     URMA_LIB=$(find_dir_of_lib urma)
     URMA_HDR=$(find_dir_of_header urma_api.h)
     if [ -z "$URMA_HDR" ]; then
@@ -629,7 +638,18 @@ OLD_LIBS=$LIBS
 append_to_output "ifeq (\$(NEED_GPERFTOOLS), 1)"
 # required by cpu/heap profiler
 TCMALLOC_LIB=$(find_dir_of_lib tcmalloc_and_profiler)
-if [ -z "$TCMALLOC_LIB" ]; then
+if [ $WITH_URMA != 0 ]; then
+    # libtcmalloc is already mandatory. Add only the standalone CPU profiler,
+    # never a second allocator from libtcmalloc_and_profiler.
+    URMA_PROFILER_LIB=$(find_dir_of_lib profiler)
+    if [ -z "$URMA_PROFILER_LIB" ]; then
+        append_to_output "    \$(error \"Fail to find libprofiler\")"
+    else
+        append_to_output "    CPPFLAGS+=-DBRPC_ENABLE_CPU_PROFILER"
+        append_to_output_libs "$URMA_PROFILER_LIB" "    "
+        append_to_output_linkings "$URMA_PROFILER_LIB" profiler "    "
+    fi
+elif [ -z "$TCMALLOC_LIB" ]; then
     append_to_output "    \$(error \"Fail to find gperftools\")"
 elif [ $WITH_ASAN != 0 ]; then
     append_to_output "    \$(error \"gperftools is not compatible with ASAN\")"

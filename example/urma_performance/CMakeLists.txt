@@ -23,6 +23,14 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/BrpcExample.cmake)
 option(LINK_SO "Whether examples are linked dynamically" OFF)
 
 brpc_example_find_common_deps(DYNAMIC_LIB)
+find_library(TCMALLOC_LIB NAMES tcmalloc)
+get_filename_component(TCMALLOC_LIB_DIR "${TCMALLOC_LIB}" DIRECTORY)
+find_path(TCMALLOC_INCLUDE_PATH NAMES gperftools/malloc_extension.h
+    HINTS "${TCMALLOC_LIB_DIR}/../include")
+if(NOT TCMALLOC_LIB OR NOT TCMALLOC_INCLUDE_PATH)
+    message(FATAL_ERROR "URMA examples require libtcmalloc and gperftools headers")
+endif()
+list(APPEND DYNAMIC_LIB ${TCMALLOC_LIB})
 
 protobuf_generate_cpp(PROTO_SRC PROTO_HEADER test.proto)
 set(BRPC_EXAMPLE_WITH_URMA ON)
