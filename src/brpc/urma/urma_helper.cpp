@@ -66,7 +66,7 @@ DEFINE_bool(urma_use_polling, false,
 DEFINE_int32(urma_poller_num, 1,
              "Number of poller bthreads per bthread tag (polling mode only)");
 DEFINE_bool(urma_disable_bthread, false,
-            "Run the message-processing callback inline (no bthread spawned)");
+            "Deprecated: shared URMA CQs dispatch messages to bthreads");
 
 DEFINE_int32(urma_sq_size, 128,
              "Deprecated: use urma_io_sq_depth for pooled JFS");

@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <ostream>
-#include <vector>
+#include <map>
 #include <memory>
 
 #include "butil/atomicops.h"
@@ -103,10 +103,10 @@ public:
 
     // ---- Data path (called by UrmaTransport) ----
     // Cut data from the IOBuf list and post it via URMA SEND.
-    // Returns bytes sent, or -1 (errno set; EAGAIN when windows are full).
+    // Returns bytes sent, or -1 (errno set; EAGAIN when the shared SQ pool is full).
     ssize_t CutFromIOBufList(butil::IOBuf** data, size_t ndata);
 
-    // Whether the endpoint can post more sends (both windows non-empty).
+    // Whether the endpoint can post more sends (the shared pool has SQ capacity).
     bool IsWritable() const;
 
     // For debug: dump endpoint state to @os.
@@ -121,18 +121,12 @@ public:
     //   ESTABLISHED      -> drain stray TCP bytes
     static void OnNewDataFromTcp(Socket* m);
 
-    // CQ completion poller: the edge-triggered callback for the CQ socket
-    // (whose user is this endpoint). Drains urma_poll_jfc and feeds the
-    // completions into HandleCompletion, then calls InputMessenger. Event mode
-    // also drains the aggregated JFCE until urma_wait_jfc reports no event,
-    // then calls Socket::MoreReadEvents so later JFCE edges can start the
-    // callback again.
-    static void PollCq(Socket* m);
-
     // Event adapter for shared queue slots.
     static void PollIoJfc(Socket*);
     static int AttachSlotSocket(UrmaIoSlot*);
     static void DetachSlotSocket(UrmaIoSlot*);
+    static void HandleTxCompletion(UrmaJfsSlot*, const urma_cr_t&);
+    static void HandleRxCompletion(UrmaJfrSlot*, const urma_cr_t&);
 
     // Compatibility entry points; polling mode currently returns ENOTSUP.
     static int PollingModeInitialize(bthread_tag_t tag,
@@ -201,26 +195,8 @@ private:
     // Returns 0 on success.
     int ImportPeer(const ParsedHello& peer);
 
-    // Post @num recv WRs into the local JFR. If @zerocopy, use a fresh pool
-    // buffer; otherwise reuse the fixed _rbuf slot. Returns 0 on success.
-    int PostRecv(uint32_t num, bool zerocopy);
-
-    // Post a single recv WR pointing at @block of @block_size.
-    int DoPostRecv(void* block, size_t block_size);
-
-    // Send a pure-ACK URMA_OPC_SEND_IMM WR with no payload. @imm carries the
-    // number of receive WRs reposted for peer-side flow-control credit.
-    int SendImm(uint32_t imm);
-    // Batched credit ack: if _new_rq_wrs is above the threshold, flush it via
-    // a standalone SendImm. @num is the number of new recv WRs to add.
-    int SendAck(int num);
-
-    // Handle one completion record. For SEND completions: reclaim the SQ
-    // window and wake the writer. For RECV completions: cut the payload into
-    // the URMA input processor, repost the recv WR, and ack. Returns bytes
-    // received
-    // (0 for send completions), or -1 on error (errno set).
-    ssize_t HandleCompletion(const urma_cr_t& cr);
+    void ReorderAndDispatch(SocketUniquePtr&, uint16_t seq, butil::IOBuf data);
+    void DispatchReceivedBytesLocked(SocketUniquePtr&, ssize_t bytes);
 
     // Queue received bytes for InputMessenger. CQ receive completions can
     // arrive while the server is still waiting for the final TCP handshake
@@ -228,15 +204,6 @@ private:
     // after ESTABLISHED, matching the connection-ready boundary seen by user
     // code.
     void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes);
-
-    // Consume one async event from the JFCE fd (event mode only). The caller
-    // drains completions before acknowledge/rearm because the bonding provider
-    // uses poll_jfc to record which physical JFCs must be rearmed.
-    int WaitCqEvent(SocketUniquePtr& s, urma_jfc_t** event_jfc);
-
-    // Request completion notification (event mode only).
-    int ReqNotifyCq();
-
 
     inline void TryReadOnTcp();
     void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
@@ -260,43 +227,15 @@ private:
     std::shared_ptr<UrmaConnResource> _conn_res;
     SocketId _self_socket_id{INVALID_SOCKET_ID};
     SocketId _peer_socket_id{INVALID_SOCKET_ID};
-
-    // ---- Send / recv window bookkeeping ----
-    uint16_t _sq_size{0};   // local JFS depth
-    uint16_t _rq_size{0};   // local JFR depth
-
-    // The input stream carried by the URMA jetty.
+    uint16_t _next_send_seq{0};
+    uint16_t _deliver_base{0};
+    butil::Mutex _reorder_mutex;
+    std::map<uint16_t, butil::IOBuf> _reorder_queue;
     InputMessengerProcessor _input_processor;
-
-    // Per-WR send buffers (own the IOBuf until the SEND completes).
-    std::vector<butil::IOBuf> _sbuf;
-    // Per-WR recv buffers (zero-copy targets).
-    std::vector<butil::IOBuf> _rbuf;
-    std::vector<void*> _rbuf_data;
-    // Peer's advertised recv buffer size (caps each WR's payload).
     uint32_t _remote_recv_block_size{0};
-
-    // Flow-control windows (atomic; producer decrements, completion handler
-    // increments).
-    uint16_t _local_window_capacity{0};
-    uint16_t _remote_window_capacity{0};
-    butil::atomic<uint16_t> _remote_rq_window_size{0};  // WRs we can send
-    butil::atomic<uint16_t> _sq_window_size{0};          // WRs we can post
-    butil::atomic<uint16_t> _new_rq_wrs{0};              // new recv WRs (to ack)
-    uint16_t _sq_imm_window_size{0};                     // budget for pure-ack WRs
-
-    // SQ producer / consumer indices.
-    uint16_t _sq_current{0};
-    uint16_t _sq_sent{0};
-    // RQ consumer index.
-    uint16_t _rq_received{0};
 
     // Butex for waking the handshake bthread parked in ReadFromFd.
     butil::atomic<int>* _read_butex{nullptr};
-
-    // Reserved WR slots for pure-ack IMM WRs.
-    static constexpr uint16_t RESERVED_WR_NUM = 3;
-
 
     DISALLOW_COPY_AND_ASSIGN(UrmaEndpoint);
 };

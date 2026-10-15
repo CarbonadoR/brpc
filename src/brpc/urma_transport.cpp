@@ -160,16 +160,12 @@ void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
 }
 
 void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
-                                 int* num_bthread_created, bool last_msg) {
-    if (last_msg && !urma::FLAGS_urma_use_polling) {
-        return;
-    }
+                                 int* num_bthread_created, bool /*last_msg*/) {
+    // A shared receive CQ must keep replenishing buffers even when an RPC
+    // callback blocks (including a response waiting on the shared SQ).
+    // Dispatch the last parsed message too, rather than running it inline.
     InputMessageBase* to_run_msg = input_msg.release();
     if (!to_run_msg) {
-        return;
-    }
-    if (urma::FLAGS_urma_disable_bthread) {
-        Transport::ProcessInputMessage(to_run_msg);
         return;
     }
     bthread_t th;
@@ -179,7 +175,7 @@ void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
     tmp.keytable_pool = _socket->keytable_pool();
     tmp.tag = bthread_self_tag();
     bthread_attr_set_name(&tmp, "ProcessInputMessage");
-    if (!FLAGS_usercode_in_coroutine && bthread_start_background(
+    if (bthread_start_background(
             &th, &tmp, Transport::ProcessInputMessage, to_run_msg) == 0) {
         ++*num_bthread_created;
     } else {
