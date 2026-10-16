@@ -33,6 +33,7 @@
 #include <gflags/gflags.h>
 
 #include "butil/atomicops.h"
+#include "butil/containers/stack_container.h"
 #include "butil/iobuf.h"
 #include "butil/logging.h"
 #include "butil/macros.h"
@@ -346,14 +347,15 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
     return _conn_res->remote_jfr ? 0 : -1;
 }
 
-// One body SGE per WR. A fragmented IOBuf becomes multiple ordered messages;
-// each context holds its exact block references through the corresponding CQE.
+// Gather across IOBufs until either the JFS SGE limit (including the header)
+// or the CTP body limit is reached. Keep caller data intact until post succeeds.
 ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     if (!_conn_res || !_conn_res->remote_jfr || !g_urma_pool) {
         errno = ENOTCONN;
         return -1;
     }
     ssize_t total = 0;
+    butil::StackVector<urma_sge_t, 16> sge;
     for (size_t i = 0; i < ndata; ) {
         if (from[i]->empty()) { ++i; continue; }
         UrmaJfsSlot* slot = g_urma_pool->AcquireJfs();
@@ -382,10 +384,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         if (GetUrmaRecvBlockSize() <= sizeof(UrmaMsgHeader)) { return fail(EMSGSIZE); }
         limit = std::min(limit, GetUrmaRecvBlockSize() - sizeof(UrmaMsgHeader));
 #endif
-        const size_t len = std::min(limit, from[i]->backing_block(0).size());
-        if (!len) { return fail(EMSGSIZE); }
-        urma_sge_t sge[2]{};
-        uint32_t count = 2;
+        if (!limit) { return fail(EMSGSIZE); }
+        size_t len = 0;
+        sge->clear();
 #if BRPC_URMA_SINGLE_SGE
         void* wire = nullptr;
         {
@@ -393,40 +394,62 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                 &ctx->send_data, GetUrmaRecvBlockSize() + IOBUF_BLOCK_HEADER_LEN);
             int size = 0;
             if (!stream.Next(&wire, &size) ||
-                size < static_cast<int>(sizeof(UrmaMsgHeader) + len)) {
+                size < static_cast<int>(sizeof(UrmaMsgHeader) + limit)) {
                 return fail(ENOMEM);
             }
             std::memcpy(wire, ctx->header_buf, sizeof(UrmaMsgHeader));
-            from[i]->copy_to(static_cast<char*>(wire) + sizeof(UrmaMsgHeader), len);
+            // Input block boundaries do not consume SGEs in the copying mode.
+            for (size_t j = i; j < ndata && len < limit; ++j) {
+                len += from[j]->copy_to(
+                    static_cast<char*>(wire) + sizeof(UrmaMsgHeader) + len,
+                    limit - len);
+            }
+            stream.BackUp(size - sizeof(UrmaMsgHeader) - len);
         }
+        sge->push_back(urma_sge_t{});
         sge[0].addr = reinterpret_cast<uint64_t>(wire);
         sge[0].len = sizeof(UrmaMsgHeader) + len;
         sge[0].tseg = GetPoolSegFor(wire);
-        count = 1;
 #else
-        // Copy only IOBuf references. Leave the caller's data untouched until
-        // the provider accepts the WR, so post failures cannot lose bytes.
-        from[i]->append_to(&ctx->send_data, len);
-        const void* body = ctx->send_data.fetch1();
+        const uint32_t max_sge = slot->jfs->jfs_cfg.max_sge;
+        if (max_sge < 2) { return fail(EINVAL); }
+        sge->push_back(urma_sge_t{});
         sge[0].addr = reinterpret_cast<uint64_t>(ctx->header_buf);
         sge[0].len = sizeof(UrmaMsgHeader);
         sge[0].tseg = GetHeaderPoolSegFor(ctx->header_buf);
-        sge[1].addr = reinterpret_cast<uint64_t>(body);
-        sge[1].len = len;
-        sge[1].tseg = GetPoolSegFor(const_cast<void*>(body));
-        if (!sge[1].tseg) {
-            sge[1].tseg = reinterpret_cast<urma_target_seg_t*>(
-                static_cast<uintptr_t>(ctx->send_data.get_first_data_meta()));
+        for (size_t j = i; j < ndata && len < limit && sge->size() < max_sge; ++j) {
+            size_t offset = 0;
+            for (size_t block = 0; block < from[j]->backing_block_num() &&
+                    len < limit && sge->size() < max_sge; ++block) {
+                const butil::StringPiece piece = from[j]->backing_block(block);
+                urma_sge_t body{};
+                body.addr = reinterpret_cast<uint64_t>(piece.data());
+                body.len = std::min(piece.size(), limit - len);
+                body.tseg = GetPoolSegFor(const_cast<char*>(piece.data()));
+                if (!body.tseg) {
+                    // User-registered blocks can have different segment handles
+                    // within the same IOBuf. Resolve the metadata at this offset.
+                    butil::IOBuf first_byte;
+                    from[j]->append_to(&first_byte, 1, offset);
+                    body.tseg = reinterpret_cast<urma_target_seg_t*>(
+                        static_cast<uintptr_t>(first_byte.get_first_data_meta()));
+                }
+                sge->push_back(body);
+                len += body.len;
+                offset += body.len;
+            }
+            // Retain the gathered prefix in one pass, without copying bytes.
+            from[j]->append_to(&ctx->send_data, offset);
         }
 #endif
-        if (!sge[0].tseg || (count == 2 && !sge[1].tseg)) {
-            return fail(ERDMAMEM);
+        for (const auto& part : sge.container()) {
+            if (!part.tseg) { return fail(ERDMAMEM); }
         }
         urma_jfs_wr_t wr{};
         wr.opcode = URMA_OPC_SEND;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _conn_res->remote_jfr;
-        wr.send.src = urma_sg_t{sge, count};
+        wr.send.src = urma_sg_t{sge->data(), static_cast<uint32_t>(sge->size())};
         wr.user_ctx = reinterpret_cast<uint64_t>(ctx.get());
         // PostSend serializes publication with CQ draining. After it returns,
         // the CQE may already have destroyed ctx: release without dereferencing.
@@ -434,7 +457,11 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             return fail(errno);
         }
         ctx.release();
-        from[i]->pop_front(len);
+        size_t remaining = len;
+        while (remaining != 0) {
+            remaining -= from[i]->pop_front(remaining);
+            if (from[i]->empty()) { ++i; }
+        }
         ++_next_send_seq;
         total += len;
     }

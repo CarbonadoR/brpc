@@ -140,7 +140,7 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
         cfg.depth = slot->sq_depth;
         cfg.trans_mode = URMA_TM_RM;
         cfg.priority = GetUrmaJettyPriority();
-        cfg.max_sge = BRPC_URMA_SINGLE_SGE ? 1 : 2;
+        cfg.max_sge = BRPC_URMA_SINGLE_SGE ? 1 : GetUrmaMaxSge();
         cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
         cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
         cfg.jfc = slot->jfc;
