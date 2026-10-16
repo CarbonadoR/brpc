@@ -45,9 +45,12 @@ be combined with tcmalloc. Make also requires the headers and `libtcmalloc`;
 Bazel requires `@gperftools//:tcmalloc`, sharing the same allocator target
 with the tests.
 
-The default send has exactly two SGEs: a 64-byte header and one body fragment.
+The default send gathers a 64-byte header SGE and as many body SGEs as fit
+within the JFS SGE limit (device capability, capped by `--urma_max_sge`) and
+the 4032-byte body limit. Gathering spans both blocks and consecutive IOBufs.
 `URMA_SINGLE_SGE=ON` in CMake (or the C++ macro `BRPC_URMA_SINGLE_SGE=1`)
-enables copying header and body into a single registered send buffer. Receives
+enables copying header and up to 4032 body bytes into one registered send
+buffer, regardless of the number of input fragments. Receives
 always use two SGEs; both builds share the same wire bytes.
 CTP limits each complete SEND to 4096 bytes, including the 64-byte header.
 Both send modes therefore split bodies into fragments of at most 4032 bytes,
@@ -153,7 +156,9 @@ provider routing; this phase does not issue READs.
 
 The 64-byte header contains network-order destination SocketId (8 bytes),
 sequence (2 bytes), type (1 byte, MSG_SMALL=1), and 53 zero reserved bytes.
-A fragmented IOBuf is sent as consecutive messages, one body fragment per WR.
+A WR gathers consecutive body fragments across the input IOBuf list until
+either the total SGE count (including the header) or body byte limit is reached.
+Each body SGE retains its own registered segment and IOBuf reference until CQE.
 Caller data is consumed and sequence advanced only after a successful post.
 The compatibility mode reduces the body limit to leave header space in the
 registered send block. Receive body capacity is the configured block size
@@ -186,7 +191,7 @@ TLS caches is retained during initialization rollback.
 | `--urma_recv_zerocopy` | true | Enable zero-copy receive |
 | `--urma_zerocopy_min_size` | 512 | Copy smaller receives |
 | `--urma_device` | empty | Device name; empty selects the first |
-| `--urma_max_sge` | 0 | Device SGE capability override |
+| `--urma_max_sge` | 0 | Cap total send SGEs including header; 0 uses device maximum; copying mode always sends one SGE |
 | `--urma_client_handshake_version` | 2 | Binary=2, protobuf=3 |
 
 Header count must cover total RX depth plus total TX depth. Data block count
@@ -271,6 +276,9 @@ the executable and its shared libraries are needed on the peer.
   --requests=150 --threads=4 --urma_client_handshake_version=2
 ./urma_verify --server=SERVER_IP:18083 --urma_device=udmac0d1e2 \
   --requests=70000 --sizes=64
+./urma_verify --server=SERVER_IP:18083 --urma_device=udmac0d1e2 \
+  --requests=1000 --threads=8 --fragment_bytes=127 \
+  --sizes=4031,4032,4033,4096,65536
 ```
 
 Every response must echo the request's distinct attachment byte for byte.
@@ -278,6 +286,16 @@ The server verifies the receiving Socket's established URMA state and rejects
 TCP fallback. A failed check returns a nonzero exit code. Use `--sizes` for
 attachment sizes, `--connection_type=pooled|short|single` for connection reuse,
 and `--urma_client_handshake_version=3` for protobuf handshakes.
+`--fragment_bytes` splits attachments into separate registered blocks of that
+size; the default of 0 disables forced fragmentation.
+
+After the send-gathering change, another 10,400 cross-node RPCs passed with
+127-byte fragments, 0–64KiB attachments, mixed send modes and all three
+connection types. Provider instrumentation observed up to 13 send SGEs in the
+default mode and exactly one in the copying mode. Both reached the 4096-byte
+wire limit without exceeding it. Explicit limits of two SGEs (default mode)
+and one SGE (copying mode) also passed. Both builds passed 38 URMA unit tests
+and SGE configuration checks; all 23 Socket regression tests passed.
 
 On 2026-10-15, 17 cases totaling 142,820 RPCs passed between two aarch64 nodes
 using UMDK 25.12, `udmac0d1e2`, CTP and tcmalloc. Coverage included both

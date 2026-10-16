@@ -44,9 +44,11 @@ UMDK commit，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `libur
 `libtcmalloc`；Bazel 使用必需的 `@gperftools//:tcmalloc` 依赖，
 与测试复用同一个分配器目标。
 
-默认发送两个 SGE：64B header + 一个连续 body。编译时设置
+默认发送一个 64B header SGE，并跨 IOBuf 和 block 聚合多个 body SGE，
+直到总 SGE 数达到设备/`--urma_max_sge` 上限，或 body 达到 4032B。编译时设置
 `-DURMA_SINGLE_SGE=ON`（CMake）或 `-DBRPC_URMA_SINGLE_SGE=1`
-（C++ 编译宏），可启用拷贝合并发送；接收仍固定为两个 SGE。
+（C++ 编译宏），可启用拷贝合并发送：不受输入片段数限制，尽量收集
+4032B body，与 header 合成一个 SGE；接收仍固定为两个 SGE。
 两种构建使用相同的线格式，不需要逐连接协商 SGE 模式。
 
 ### Make 编译
@@ -134,6 +136,11 @@ server.Start(port, &sopt);
 ./urma_verify --server=SERVER_IP:18083 --urma_device=udmac0d1e2 \
   --requests=60 --threads=2 --connection_type=short
 
+# 强制碎片化，验证跨 block 聚合和 CTP 边界
+./urma_verify --server=SERVER_IP:18083 --urma_device=udmac0d1e2 \
+  --requests=1000 --threads=8 --fragment_bytes=127 \
+  --sizes=4031,4032,4033,4096,65536
+
 # 16 位序号回绕
 ./urma_verify --server=SERVER_IP:18083 --urma_device=udmac0d1e2 \
   --requests=70000 --sizes=64
@@ -142,7 +149,8 @@ server.Start(port, &sopt);
 校验程序对每条请求生成不同的附件内容，逐字节核对回显；服务端检查实际
 Socket 的 URMA ESTABLISHED 状态，拒绝 TCP 回退。失败返回非零退出码。
 `--sizes` 可配置尺寸列表，`--connection_type` 支持 single/pooled/short，
-v3 握手使用 `--urma_client_handshake_version=3`。
+v3 握手使用 `--urma_client_handshake_version=3`。`--fragment_bytes` 将附件拆成
+指定大小的独立注册块，默认 0 表示不强制碎片化。
 
 2026-10-15 在两台 aarch64 节点、UMDK 25.12、`udmac0d1e2` CTP 模式及
 tcmalloc 下完成 17 组校验，共 142,820 次 RPC，全部通过：
@@ -154,8 +162,15 @@ tcmalloc 下完成 17 组校验，共 142,820 次 RPC，全部通过：
 - 默认 128 JFS / 64 JFR，以及缩小的 4 JFS / 2 JFR 配置。
 
 验证中修正了 CTP 总长度限制和并发派生 Socket 共享 `UrmaConnect` 回调状态的问题。
-两种构建各 31 项 URMA 单测及 23 项 Socket 回归测试通过。吞吐、延迟压测和
-故障注入仍待后续验证。
+两种构建各 31 项 URMA 单测及 23 项 Socket 回归测试通过。该轮验证不包含
+吞吐、延迟压测和故障注入。
+
+发送聚合改动后，同日额外完成 10,400 次跨节点 RPC：覆盖 127B 独立碎片、
+0–64KiB 附件、两种模式互通和 single/pooled/short 连接。实机观测到默认模式
+使用最多 13 个 SGE，单 SGE 模式固定为 1；均可填满 4096B 整包且未超限。
+`--urma_max_sge=2` 和单 SGE 模式的 `--urma_max_sge=1` 也通过校验。
+两种构建各通过 38 项 URMA 单测及 SGE 配置边界测试；默认构建的
+23 项 Socket 回归测试通过。
 
 ## 架构与生命周期
 
@@ -189,10 +204,13 @@ pooled/short 派生 Socket 各自创建 `UrmaConnect`，不共享主 Socket 的�
 
 每条数据消息是 `UrmaMsgHeader(64B) + body`，头部包含网络字节序的
 `dst_socket_id:uint64`、`seq:uint16`、`type:uint8=MSG_SMALL` 和 53 个零字节。
-默认每个 WR 只发送一个 IOBuf block 的一段，所有 body SGEs 均由注册段支撑。
+默认每个 WR 跨输入列表预取多个 IOBuf block 的连续片段，header 占一个
+SGE，其余 SGE 尽量填充 body，达到总 SGE 数或 body 长度上限即提交。
+所有 body SGE 均由各自的注册段支撑，并持有相应 IOBuf 引用至 CQE。
 CTP 每条 SEND 的总长度上限为 4096B，包含 64B header，因此两种发送模式
 均将 body 限制在 4032B 以内；较大的 IOBuf 会拆成多个带序号的 WR。
-单 SGE 模式在注册块内拼接头和 body，并相应缩小该 WR 的 body 上限。
+单 SGE 模式跨任意数量的输入片段拷贝 body，在注册块内拼接头和 body；
+若本地注册块或对端接收块较小，进一步缩小该 WR 的 body 上限。
 接收 SGE[0] 为独立 64B header，SGE[1] 为 IOBuf block data 区
 （默认 8192 减去 IOBuf Block 元数据，通常为 8160B）。
 
@@ -250,7 +268,7 @@ CTP 每条 SEND 的总长度上限为 4096B，包含 64B header，因此两种�
 | `--urma_recv_zerocopy` | true | 启用接收零拷贝 |
 | `--urma_zerocopy_min_size` | 512 | 小于阈值的消息拷贝到读缓冲区 |
 | `--urma_device` | 空 | 指定设备，否则选第一个 |
-| `--urma_max_sge` | 0 | 设备能力上限覆盖；默认发送至少需要 2 |
+| `--urma_max_sge` | 0 | 含 header 的总发送 SGE 上限；0 使用设备能力，默认模式至少为 2，拷贝模式固定为 1 |
 | `--urma_client_handshake_version` | 2 | 二进制=2，protobuf=3 |
 
 header 数量至少覆盖所有 RX 和 TX slot 深度之和，数据块数量须大于
