@@ -580,7 +580,7 @@ static urma_status_t PostSend(urma_jfc_t* local_jfc, urma_jfs_wr_t* wr,
         PendingRecv recv = std::move(recv_it->second.front());
         recv_it->second.pop_front();
         // Scatter the concatenated send bytes into the posted receive SGEs.
-        // This covers 2->2 as well as the compile-time compatibility 1->2 path.
+        // This covers N->2 as well as the compile-time compatibility 1->2 path.
         size_t dst_index = 0, dst_offset = 0;
         for (uint32_t i = 0; i < current->send.src.num_sge; ++i) {
             const auto& src = current->send.src.sge[i];

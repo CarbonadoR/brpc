@@ -17,8 +17,10 @@
 
 // Bounded, byte-for-byte validation against a real URMA peer. Both sides
 // reject TCP fallback; this is a correctness check, not a benchmark.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -45,6 +47,8 @@ DEFINE_string(connection_type, "single", "single, pooled, or short");
 DEFINE_string(sizes, "0,1,63,64,511,512,4096,8159,8160,8161,16384,65536",
               "Comma-separated attachment sizes cycled by request id");
 DEFINE_int32(timeout_ms, 5000, "Per-RPC timeout; retries are disabled");
+DEFINE_int32(fragment_bytes, 0,
+             "Use separate registered attachment blocks of this size; 0 disables fragmentation");
 
 class VerifyService : public test::PerfTestService {
 public:
@@ -91,7 +95,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (FLAGS_mode != "client" || FLAGS_requests <= 0 || FLAGS_threads <= 0 ||
-        FLAGS_timeout_ms <= 0) {
+        FLAGS_timeout_ms <= 0 || FLAGS_fragment_bytes < 0) {
         LOG(ERROR) << "Invalid verification arguments";
         return 1;
     }
@@ -119,6 +123,10 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "URMA client initialization failed";
         return 1;
     }
+    if (static_cast<size_t>(FLAGS_fragment_bytes) > brpc::urma::GetUrmaRecvBlockSize()) {
+        LOG(ERROR) << "Verification fragment exceeds the registered block capacity";
+        return 1;
+    }
     std::atomic<int> next{0};
     std::atomic<int> passed{0};
     std::atomic<bool> failed{false};
@@ -141,7 +149,28 @@ int main(int argc, char** argv) {
                 }
                 brpc::Controller cntl;
                 cntl.set_log_id(id);
-                cntl.request_attachment().append(payload);
+                if (FLAGS_fragment_bytes == 0) {
+                    cntl.request_attachment().append(payload);
+                } else {
+                    for (size_t offset = 0; offset < payload.size(); ) {
+                        butil::IOBufAsZeroCopyOutputStream stream(
+                            &cntl.request_attachment(),
+                            brpc::urma::GetUrmaRecvBlockSize() + sizeof(butil::IOBuf::Block));
+                        void* block = nullptr;
+                        int capacity = 0;
+                        const size_t len = std::min<size_t>(
+                            FLAGS_fragment_bytes, payload.size() - offset);
+                        if (!stream.Next(&block, &capacity) ||
+                            static_cast<size_t>(capacity) < len) {
+                            LOG(ERROR) << "Cannot allocate verification fragment";
+                            failed.store(true);
+                            return;
+                        }
+                        memcpy(block, payload.data() + offset, len);
+                        stream.BackUp(capacity - len);
+                        offset += len;
+                    }
+                }
                 test::PerfTestRequest request;
                 test::PerfTestResponse response;
                 request.set_echo_attachment(true);

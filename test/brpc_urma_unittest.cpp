@@ -616,6 +616,30 @@ TEST_F(UrmaMockTest,
 // event adapter so completions can be delivered in a controlled order.
 class UrmaPooledTest : public ::testing::Test {
 protected:
+    // These pools have no event adapter: tests drive all posts and CQ polling.
+    class RecordingPool : public urma::UrmaResourcePool {
+    public:
+        int PostSend(urma::UrmaJfsSlot* slot, urma_jfs_wr_t* wr,
+                     urma::TxCompletionCtx* ctx) override {
+            const int rc = UrmaResourcePool::PostSend(slot, wr, ctx);
+            if (rc == 0) {
+                sends.emplace_back(wr->send.src.sge,
+                                   wr->send.src.sge + wr->send.src.num_sge);
+            }
+            return rc;
+        }
+        std::vector<std::vector<urma_sge_t>> sends;
+    };
+    void AppendBlock(butil::IOBuf* data, size_t len, char value) {
+        // An explicit block size bypasses TLS so adjacent fragments cannot merge.
+        butil::IOBufAsZeroCopyOutputStream stream(data, 8192);
+        void* buffer = nullptr;
+        int size = 0;
+        ASSERT_TRUE(stream.Next(&buffer, &size));
+        ASSERT_GE(static_cast<size_t>(size), len);
+        memset(buffer, value, len);
+        stream.BackUp(size - len);
+    }
     static void SetUpTestSuite() {
         urma::g_skip_urma_init = false;
         urma::FLAGS_urma_io_jfs_cnt = 2;
@@ -633,7 +657,7 @@ protected:
             GTEST_SKIP() << "Requires the URMA software provider";
         }
         _original = urma::g_urma_pool;
-        _pool.reset(new urma::UrmaResourcePool);
+        _pool.reset(new RecordingPool);
         ASSERT_EQ(0, _pool->Initialize(urma::GetUrmaContext(), {}));
         urma::g_urma_pool = _pool.get();
     }
@@ -685,7 +709,7 @@ protected:
             }
         }
     }
-    std::unique_ptr<urma::UrmaResourcePool> _pool;
+    std::unique_ptr<RecordingPool> _pool;
     urma::UrmaResourcePool* _original{nullptr};
     std::vector<SocketUniquePtr> _sockets;
 };
@@ -735,6 +759,10 @@ TEST_F(UrmaPooledTest, independent_queues_and_import_cache) {
     EXPECT_EQ(1u, _pool->imports->size());
     EXPECT_NE(_pool->io_jfs[0]->jfc, _pool->io_jfr[0]->jfc);
     EXPECT_EQ(2u, _pool->io_jfr[0]->jfr->jfr_cfg.max_sge);
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(BRPC_URMA_SINGLE_SGE ? 1 : urma::GetUrmaMaxSge(),
+                  slot->jfs->jfs_cfg.max_sge);
+    }
     EXPECT_EQ(8u, _pool->io_jfr[0]->pending.size());
     a->Reset();
     EXPECT_EQ(1u, _pool->imports->size());
@@ -827,25 +855,219 @@ TEST_F(UrmaPooledTest, post_failure_preserves_caller_data_and_sequence) {
     ASSERT_NE(nullptr, sender);
     ASSERT_NE(nullptr, receiver);
     Connect(sender, receiver);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 7; ++i) {
         butil::IOBuf data;
         data.append("a");
         butil::IOBuf* input[] = {&data};
         ASSERT_EQ(1, sender->CutFromIOBufList(input, 1));
     }
-    butil::IOBuf remaining;
-    remaining.append("after-failure");
-    butil::IOBuf* input[] = {&remaining};
-    EXPECT_EQ(-1, sender->CutFromIOBufList(input, 1));
+    butil::IOBuf first, remaining, last, empty;
+    AppendBlock(&first, 1000, 'b');
+    AppendBlock(&remaining, 5000, 'c');
+    AppendBlock(&last, 500, 'd');
+    butil::IOBuf* input[] = {&first, &empty, &remaining, &last};
+    // Only one receive remains. Commit a full message spanning two inputs,
+    // then fail the next post without consuming any of its gathered fragments.
+    EXPECT_EQ(4032, sender->CutFromIOBufList(input, 4));
+    EXPECT_TRUE(first.empty());
+    EXPECT_EQ(std::string(1968, 'c'), remaining.to_string());
+    EXPECT_EQ(std::string(500, 'd'), last.to_string());
+    EXPECT_EQ(-1, sender->CutFromIOBufList(input, 4));
     EXPECT_EQ(EAGAIN, errno);
-    EXPECT_EQ("after-failure", remaining.to_string());
+    EXPECT_EQ(std::string(1968, 'c'), remaining.to_string());
+    EXPECT_EQ(std::string(500, 'd'), last.to_string());
     EXPECT_EQ(8u, sender->_next_send_seq);
     DrainRx();
     DrainTx();
-    EXPECT_EQ(13, sender->CutFromIOBufList(input, 1));
+    EXPECT_EQ(2468, sender->CutFromIOBufList(input, 4));
     DrainRx();
     DrainTx();
-    EXPECT_EQ("aaaaaaaaafter-failure", receiver->_input_processor.read_buf().to_string());
+    EXPECT_EQ(std::string(7, 'a') + std::string(1000, 'b') +
+                  std::string(5000, 'c') + std::string(500, 'd'),
+              receiver->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, gather_across_iobufs_until_ctp_body_limit) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf first, second, empty;
+    AppendBlock(&first, 1000, 'a');
+    AppendBlock(&first, 2000, 'b');
+    AppendBlock(&second, 1033, 'c');
+#if !BRPC_URMA_SINGLE_SGE
+    const void* addresses[] = {first.backing_block(0).data(),
+                              first.backing_block(1).data(), second.fetch1()};
+#endif
+    const std::string expected = first.to_string() + second.to_string();
+    butil::IOBuf* input[] = {&empty, &first, &empty, &second, &empty};
+    ASSERT_EQ(4033, sender->CutFromIOBufList(input, 5));
+    EXPECT_TRUE(first.empty());
+    EXPECT_TRUE(second.empty());
+    EXPECT_EQ(2u, sender->_next_send_seq);
+    ASSERT_EQ(2u, _pool->sends.size());
+#if BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ(1u, _pool->sends[0].size());
+    EXPECT_EQ(4096u, _pool->sends[0][0].len);
+    EXPECT_EQ(65u, _pool->sends[1][0].len);
+#else
+    ASSERT_EQ(4u, _pool->sends[0].size());
+    EXPECT_EQ(64u, _pool->sends[0][0].len);
+    EXPECT_EQ(1000u, _pool->sends[0][1].len);
+    EXPECT_EQ(2000u, _pool->sends[0][2].len);
+    EXPECT_EQ(1032u, _pool->sends[0][3].len);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(reinterpret_cast<uint64_t>(addresses[i]), _pool->sends[0][i + 1].addr);
+    }
+    ASSERT_EQ(2u, _pool->sends[1].size());
+    EXPECT_EQ(1u, _pool->sends[1][1].len);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(addresses[2]) + 1032,
+              _pool->sends[1][1].addr);
+#endif
+    DrainRx(true);
+    EXPECT_EQ(expected, receiver->_input_processor.read_buf().to_string());
+    DrainTx();
+}
+
+TEST_F(UrmaPooledTest, gather_stops_at_sge_limit_only_in_zero_copy_mode) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    const size_t max_sge = urma::GetUrmaMaxSge();
+    const size_t fragments = max_sge + 2;
+    ASSERT_LT((max_sge - 1) * 512, 4032u);
+    butil::IOBuf first, second, empty;
+    std::string expected;
+    for (size_t i = 0; i < fragments; ++i) {
+        AppendBlock(i < max_sge / 2 ? &first : &second, 512, 'a' + i);
+        expected.append(512, 'a' + i);
+    }
+    butil::IOBuf* input[] = {&first, &empty, &second};
+    ASSERT_EQ(static_cast<ssize_t>(expected.size()), sender->CutFromIOBufList(input, 3));
+#if BRPC_URMA_SINGLE_SGE
+    ASSERT_EQ((expected.size() + 4031) / 4032, _pool->sends.size());
+    size_t remaining = expected.size();
+    for (const auto& send : _pool->sends) {
+        ASSERT_EQ(1u, send.size());
+        const size_t body = std::min<size_t>(remaining, 4032);
+        EXPECT_EQ(64 + body, send[0].len);
+        remaining -= body;
+    }
+#else
+    ASSERT_EQ((fragments + max_sge - 2) / (max_sge - 1), _pool->sends.size());
+    ASSERT_EQ(max_sge, _pool->sends[0].size());
+    for (const auto& send : _pool->sends) {
+        EXPECT_LE(send.size(), max_sge);
+        EXPECT_EQ(64u, send[0].len);
+        for (size_t i = 1; i < send.size(); ++i) { EXPECT_EQ(512u, send[i].len); }
+    }
+#endif
+    DrainRx(true);
+    EXPECT_EQ(expected, receiver->_input_processor.read_buf().to_string());
+    DrainTx();
+}
+
+TEST_F(UrmaPooledTest, gather_respects_smaller_peer_receive_capacity) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    sender->_remote_recv_block_size = 128;
+    butil::IOBuf first, second;
+    AppendBlock(&first, 64, 'a');
+    AppendBlock(&second, 110, 'b');
+    butil::IOBuf* input[] = {&first, &second};
+    ASSERT_EQ(174, sender->CutFromIOBufList(input, 2));
+    ASSERT_EQ(2u, _pool->sends.size());
+    for (size_t i = 0; i < 2; ++i) {
+        size_t wire_len = 0;
+        for (const auto& sge : _pool->sends[i]) { wire_len += sge.len; }
+        EXPECT_EQ(i == 0 ? 192u : 110u, wire_len);
+    }
+    DrainRx();
+    EXPECT_EQ(std::string(64, 'a') + std::string(110, 'b'),
+              receiver->_input_processor.read_buf().to_string());
+    DrainTx();
+}
+
+TEST_F(UrmaPooledTest, gather_retains_each_user_registered_segment) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    auto released = std::make_shared<int>(0);
+    butil::IOBuf data;
+    std::vector<uint64_t> segments;
+    for (int i = 0; i < 3; ++i) {
+        void* block = malloc(100);
+        ASSERT_NE(nullptr, block);
+        memset(block, 'a' + i, 100);
+        const uint64_t segment = urma::RegisterMemoryForUrma(block, 100);
+        ASSERT_NE(0u, segment);
+        segments.push_back(segment);
+        ASSERT_EQ(0, data.append_user_data_with_meta(block, 100, [released](void* p) {
+            urma::DeregisterMemoryForUrma(p);
+            free(p);
+            ++*released;
+        }, segment));
+    }
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(300, sender->CutFromIOBufList(input, 1));
+    EXPECT_TRUE(data.empty());
+    ASSERT_EQ(1u, _pool->sends.size());
+#if BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ(3, *released);
+#else
+    EXPECT_EQ(0, *released);
+    ASSERT_EQ(4u, _pool->sends[0].size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        EXPECT_EQ(segments[i], reinterpret_cast<uint64_t>(_pool->sends[0][i + 1].tseg));
+    }
+#endif
+    DrainRx();
+    EXPECT_EQ(std::string(100, 'a') + std::string(100, 'b') + std::string(100, 'c'),
+              receiver->_input_processor.read_buf().to_string());
+    DrainTx();
+    EXPECT_EQ(3, *released);
+}
+
+TEST_F(UrmaPooledTest, gather_unregistered_fragment_does_not_consume_input) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf first, second;
+    AppendBlock(&first, 100, 'a');
+    void* unregistered = malloc(100);
+    ASSERT_NE(nullptr, unregistered);
+    memset(unregistered, 'b', 100);
+    ASSERT_EQ(0, second.append_user_data(unregistered, 100, free));
+    butil::IOBuf* input[] = {&first, &second};
+#if BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ(200, sender->CutFromIOBufList(input, 2));
+    DrainRx();
+    DrainTx();
+    EXPECT_EQ(std::string(100, 'a') + std::string(100, 'b'),
+              receiver->_input_processor.read_buf().to_string());
+#else
+    EXPECT_EQ(-1, sender->CutFromIOBufList(input, 2));
+    EXPECT_EQ(ERDMAMEM, errno);
+    EXPECT_EQ(std::string(100, 'a'), first.to_string());
+    EXPECT_EQ(std::string(100, 'b'), second.to_string());
+    EXPECT_EQ(0u, sender->_next_send_seq);
+    EXPECT_TRUE(_pool->sends.empty());
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(0u, slot->sq_inflight.load());
+        EXPECT_TRUE(slot->pending.empty());
+    }
+#endif
 }
 
 TEST_F(UrmaPooledTest, disconnect_keeps_dma_and_imports_alive_until_completion) {
