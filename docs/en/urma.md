@@ -103,6 +103,27 @@ headers available inside Bazel's default sandbox.
 `BRPC_URMA_USE_MOCK=true` forces the link-time mock, while `false` excludes it
 and links `liburma`. If unspecified, URMA builds use the mock by default.
 
+The `ub_test` targets are `//example:ub_test_client` and
+`//example:ub_test_server`. They require Linux and URMA support. On a build
+host with UMDK installed, use:
+
+```bash
+# Multi-SGE, real URMA, required tcmalloc and CPU-frequency timing
+bazel build --config=ub_test //example:ub_test_client //example:ub_test_server
+
+# Single-SGE copying mode with the same workload and timing configuration
+bazel build --config=ub_test_single_sge //example:ub_test_client //example:ub_test_server
+```
+
+Outputs are `bazel-bin/example/ub_test_client` and `ub_test_server`. Save each
+mode's binaries before building the other mode, which updates the same paths.
+`--define=BRPC_URMA_SINGLE_SGE=true` configures the macro in both brpc and its
+consumers; defining it only for the benchmark does not change the transport.
+Both configurations exclude the mock and enable optimized builds. The matrix
+runner in `example/ub_test/run_ub_test_matrix.py` still uses the two-mode shared
+library archive produced by the CMake-based `example/ub_test/build_package.py`;
+the Bazel targets build the benchmark programs independently.
+
 ## Usage
 
 Select the transport by setting `socket_mode` on the channel / server:

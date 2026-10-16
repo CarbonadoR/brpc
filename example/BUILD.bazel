@@ -63,6 +63,54 @@ brpc_proto_library(
     proto_deps = [],
 )
 
+brpc_proto_library(
+    name = "cc_ub_test_proto",
+    srcs = ["ub_test/test.proto"],
+    include = "ub_test",
+    proto_deps = [],
+)
+
+# brpc propagates the URMA, SGE and timing defines to these binaries. Avoid
+# the legacy example COPTS, which unconditionally defines NO_TCMALLOC.
+UB_TEST_COPTS = ["-Wno-unused-parameter", "-fno-omit-frame-pointer"]
+
+UB_TEST_COMPATIBILITY = ["@platforms//os:linux"] + select({
+    "//bazel/config:brpc_with_urma": [],
+    "//conditions:default": ["@platforms//:incompatible"],
+})
+
+cc_binary(
+    name = "ub_test_client",
+    srcs = [
+        "ub_test/client.cpp",
+        "ub_test/sge_mode.h",
+    ],
+    copts = UB_TEST_COPTS,
+    includes = ["ub_test"],
+    malloc = "@gperftools//:tcmalloc",
+    target_compatible_with = UB_TEST_COMPATIBILITY,
+    deps = [
+        ":cc_ub_test_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_test_server",
+    srcs = [
+        "ub_test/server.cpp",
+        "ub_test/sge_mode.h",
+    ],
+    copts = UB_TEST_COPTS,
+    includes = ["ub_test"],
+    malloc = "@gperftools//:tcmalloc",
+    target_compatible_with = UB_TEST_COMPATIBILITY,
+    deps = [
+        ":cc_ub_test_proto",
+        "//:brpc",
+    ],
+)
+
 cc_binary(
     name = "echo_c++_server",
     srcs = [

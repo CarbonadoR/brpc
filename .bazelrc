@@ -89,3 +89,13 @@ build:macos-asan --dynamic_mode=off
 test:asan --test_env=ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1
 
 build:ubring --define BRPC_WITH_UBRING=true
+
+# Match the ub_test matrix's real URMA transport and timing configuration.
+build:ub_test --compilation_mode=opt
+build:ub_test --define BRPC_WITH_URMA=true
+build:ub_test --define BRPC_URMA_USE_MOCK=false
+build:ub_test --define BUTIL_USE_CPU_FREQUENCY=true
+build:ub_test --define BRPC_URMA_SINGLE_SGE=false
+
+build:ub_test_single_sge --config=ub_test
+build:ub_test_single_sge --define BRPC_URMA_SINGLE_SGE=true

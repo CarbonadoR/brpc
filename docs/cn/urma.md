@@ -96,6 +96,24 @@ Bazel 会自动获取固定 commit 的 UMDK 头文件，并通过 `@umdk//:urma_
 `BRPC_URMA_USE_MOCK=true` 强制加入 mock；设置为 `false` 则排除 mock 并链接
 `liburma`。未指定时，URMA 构建默认使用 mock。
 
+`ub_test` 的 Bazel 目标为 `//example:ub_test_client` 和
+`//example:ub_test_server`，要求 Linux 和 URMA 支持。在安装了 UMDK 的编译机上执行：
+
+```bash
+# 多 SGE，真实 URMA，必选 tcmalloc，CPU frequency 计时
+bazel build --config=ub_test //example:ub_test_client //example:ub_test_server
+
+# 单 SGE 拷贝模式，其他负载和计时配置相同
+bazel build --config=ub_test_single_sge //example:ub_test_client //example:ub_test_server
+```
+
+可执行文件位于 `bazel-bin/example/ub_test_client` 和 `ub_test_server`。
+两种模式应分别构建并保存产物，后一次构建会更新上述路径。
+`--define=BRPC_URMA_SINGLE_SGE=true` 会同时配置 brpc 库和调用方的编译宏，
+不能只对测试程序设置单 SGE 宏。两个配置都排除 mock，并启用 Release 优化。
+现有矩阵运行器 `example/ub_test/run_ub_test_matrix.py` 使用的双模式动态库归档
+仍由 `example/ub_test/build_package.py` 通过 CMake 构建；Bazel 目标用于独立构建测试程序。
+
 ## 使用
 
 通过在 channel / server 上设置 `socket_mode` 选择传输层：
