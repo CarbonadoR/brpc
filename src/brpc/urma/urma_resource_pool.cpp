@@ -27,7 +27,7 @@
 
 namespace brpc {
 namespace urma {
-DEFINE_int32(urma_io_jfs_cnt, 128, "Number of process-wide IO JFS slots");
+DEFINE_int32(urma_io_jfs_cnt, 48, "Number of process-wide IO JFS slots");
 DEFINE_int32(urma_io_jfr_cnt, 64, "Number of process-wide shared IO JFR slots");
 DEFINE_int32(urma_io_sq_depth, 128, "Depth of each pooled IO send queue");
 DEFINE_int32(urma_io_rx_depth, 512, "Depth of each shared IO receive queue");
