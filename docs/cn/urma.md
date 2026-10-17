@@ -11,7 +11,7 @@ UrmaTransport 是使用 openEuler
 ## 技术背景
 
 当前池化实现使用独立的可靠消息（`URMA_TM_RM`）JFS/JFR 和 CTP 路径。
-每个进程默认共享 128 个 JFS、64 个 JFR，每个 slot 拥有自己的 JFC/JFCE；
+每个进程默认共享 48 个 JFS、64 个 JFR，每个 slot 拥有自己的 JFC/JFCE；
 使用 `urma_post_jfs_wr` / `urma_post_jfr_wr` 收发，通过 JFCE fd 事件驱动。
 本阶段实现池化设计 13 的适配点 1–15；不包含 credit/ACK、忙轮询、bonding
 或大包单边 READ。超过一个 block 的消息分成多个 SEND。
@@ -114,6 +114,11 @@ bazel build --config=ub_test_single_sge //example:ub_test_client //example:ub_te
 现有矩阵运行器 `example/ub_test/run_ub_test_matrix.py` 使用的双模式动态库归档
 仍由 `example/ub_test/build_package.py` 通过 CMake 构建；Bazel 目标用于独立构建测试程序。
 
+矩阵脚本支持 `--io-jfs-count=48`，在两端设置相同的共享 JFS 数量，
+并从启动日志核对实际创建的数量。可分别使用 `--io-jfs-count=128` 和
+`--io-jfs-count=48` 对比共享发送队列工作集大小；省略时使用库的默认值。
+该选项不改变 QD、目标 QPS、报文尺寸、队列深度或统计口径。
+
 ## 使用
 
 通过在 channel / server 上设置 `socket_mode` 选择传输层：
@@ -177,7 +182,7 @@ tcmalloc 下完成 17 组校验，共 142,820 次 RPC，全部通过：
 - 双 SGE、单 SGE，以及两种发送模式混用；接收均为双 SGE。
 - 4 线程共用连接、并发 pooled 连接、并发 short 连接。
 - 双/单 SGE 各 70,000 次连续 RPC，覆盖 16 位序号回绕。
-- 默认 128 JFS / 64 JFR，以及缩小的 4 JFS / 2 JFR 配置。
+- 当时的默认 128 JFS / 64 JFR，以及缩小的 4 JFS / 2 JFR 配置。
 
 验证中修正了 CTP 总长度限制和并发派生 Socket 共享 `UrmaConnect` 回调状态的问题。
 两种构建各 31 项 URMA 单测及 23 项 Socket 回归测试通过。该轮验证不包含
@@ -274,7 +279,7 @@ CTP 每条 SEND 的总长度上限为 4096B，包含 64B header，因此两种�
 
 | Flag | 默认 | 用途 |
 |---|---|---|
-| `--urma_io_jfs_cnt` | 128 | 全局发送 slot 数 |
+| `--urma_io_jfs_cnt` | 48 | 全局发送 slot 数 |
 | `--urma_io_jfr_cnt` | 64 | 全局接收 slot 数 |
 | `--urma_io_sq_depth` | 128 | 每个 JFS 深度 |
 | `--urma_io_rx_depth` | 512 | 每个 JFR 深度 |

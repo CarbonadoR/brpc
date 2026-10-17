@@ -37,6 +37,13 @@ CSV_HEADER = ['urma_sge_mode', 'expected_qps', 'size'] + METRICS
 NUMBER = r'([0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)'
 
 
+def positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return number
+
+
 def parse_result(output):
     line = next((s for s in output.splitlines() if 'Avg-Latency:' in s), '')
     result = {}
@@ -63,6 +70,8 @@ def command(args, role, mode, qps, size):
     cmd = ['numactl', '-C', args.cpus, '-m', '1', binary,
            '--use_urma=true', '--urma_sge_mode=' + mode,
            '--urma_device=' + args.device, '--urma_use_polling=false']
+    if getattr(args, 'io_jfs_count', None) is not None:
+        cmd.append('--urma_io_jfs_cnt=' + str(args.io_jfs_count))
     if role == 'server':
         cmd += ['--port', str(args.port), '--rsp_size=' + str(size), '--num_threads=16']
     else:
@@ -271,6 +280,7 @@ def run_test(args, remotes, mode, qps, size):
     name = '{}-q{}-s{}'.format(mode, qps, size)
     out = Path(args.output)
     result = {'name': name, 'sge_mode': mode, 'expected_qps': qps, 'size': size,
+              'io_jfs_count': getattr(args, 'io_jfs_count', None),
               'valid': False, 'processes': {}, 'cleanup': {}}
     logs = {}
     try:
@@ -319,6 +329,10 @@ def run_test(args, remotes, mode, qps, size):
         if len(result['sockets']['urma_sockets']) != 1: failures.append('expected one established URMA connection')
         for role, info in result['process_info'].items():
             if marker not in logs[role] or 'tp=CTP' not in logs[role]: failures.append(role + ' transport')
+            if result['io_jfs_count'] is not None:
+                counts = re.findall(r'\bjfs_count=(\d+)\b', logs[role])
+                if counts != [str(result['io_jfs_count'])]:
+                    failures.append(role + ' JFS count')
             if not info['thread_affinities'] or any(set(c) != expected_cpus(args.cpus) for c in info['thread_affinities']):
                 failures.append(role + ' CPU affinity')
             if set(info['numa_policies']) != {'bind:1'}: failures.append(role + ' memory binding')
@@ -364,6 +378,8 @@ def main():
     parser.add_argument('--device', required=True)
     parser.add_argument('--port', type=int, default=10918)
     parser.add_argument('--cpus', default='96-111')
+    parser.add_argument('--io-jfs-count', type=positive_int,
+                        help='Override shared JFS count on both nodes; otherwise use the library default')
     parser.add_argument('--modes', nargs='+', choices=['multi', 'single'], default=['multi', 'single'])
     parser.add_argument('--qps', nargs='+', type=int, choices=QPS_VALUES, default=QPS_VALUES)
     parser.add_argument('--sizes', nargs='+', type=int, choices=SIZES, default=SIZES)

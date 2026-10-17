@@ -45,6 +45,23 @@ class MatrixTest(unittest.TestCase):
             srv = matrix.command(self.args, 'server', mode, 500, 8388608)
             self.assertEqual(srv[-4:], ['--port', '10918', '--rsp_size=8388608', '--num_threads=16'])
 
+    def test_jfs_override_changes_both_nodes_without_changing_workload(self):
+        for role in ('client', 'server'):
+            baseline = matrix.command(self.args, role, 'multi', 1000, 1024)
+            self.assertFalse(any('--urma_io_jfs_cnt=' in arg for arg in baseline))
+            for count in (48, 128):
+                self.args.io_jfs_count = count
+                command = matrix.command(self.args, role, 'multi', 1000, 1024)
+                command.remove('--urma_io_jfs_cnt=' + str(count))
+                self.assertEqual(command, baseline)
+            del self.args.io_jfs_count
+
+    def test_nonpositive_jfs_count_is_rejected(self):
+        for count in ('0', '-1'):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                matrix.positive_int(count)
+        self.assertEqual(matrix.positive_int('48'), 48)
+
     def test_metrics_preserve_values_and_support_scientific_notation(self):
         line, metrics, totals = matrix.parse_result('startup log\n' + self.report + '\n')
         self.assertEqual(metrics['Throughput'], '1.23e+06')
@@ -125,6 +142,40 @@ class MatrixTest(unittest.TestCase):
             self.assertEqual(result['metrics']['QPS'], '999.8')
             self.assertEqual(result['totals']['Total Requests'], 20000)
             self.assertTrue(any('process audit' in s for s in result['failures']))
+
+    def test_jfs_audit_rejects_missing_or_wrong_runtime_count(self):
+        self.args.io_jfs_count = 48
+        class LogRemote:
+            def __init__(self, report, count):
+                self.report, self.count = report, count
+            def read(self, path):
+                if path.endswith('client.exit'):
+                    return '0'
+                if path.endswith('server.exit'):
+                    return ''
+                count = '' if self.count is None else ' jfs_count=' + str(self.count)
+                return 'UB_TEST_TRANSPORT sge_mode=multi tp=CTP' + count + '\n' + self.report
+        def launched(remote, root, name, role, mode, argv):
+            return {'pid': 123, 'args': argv, 'log': role + '.log', 'exit': role + '.exit'}
+        info = {'thread_affinities': [list(range(96, 112))], 'numa_policies': {'bind:1': 1},
+                'libraries': [root + '/runtime/' + suffix for root in ('/srv/test', '/client/test')
+                              for suffix in ('multi/libbrpc.so', 'common/libtcmalloc.so.4')]}
+        with tempfile.TemporaryDirectory() as root:
+            self.args.output = root
+            for count in (48, 128, None):
+                remote = LogRemote(self.report, count)
+                with mock.patch.object(matrix, 'launch', side_effect=launched), \
+                     mock.patch.object(matrix, 'process_info', return_value=info), \
+                     mock.patch.object(matrix, 'socket_snapshot', return_value={'urma_sockets': [{}]}), \
+                     mock.patch.object(matrix, 'stop', return_value={'stopped': True}), \
+                     mock.patch.object(matrix.time, 'sleep'), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    result = matrix.run_test(self.args, {'server': remote, 'client': remote}, 'multi', 1000, 1024)
+                self.assertEqual(result['io_jfs_count'], 48)
+                self.assertEqual(result['valid'], count == 48)
+                if count != 48:
+                    self.assertIn('server JFS count', result['failures'])
+                    self.assertIn('client JFS count', result['failures'])
 
     def test_repack_does_not_truncate_an_open_runtime_file(self):
         spec = importlib.util.spec_from_file_location('package_builder', ROOT / 'example/ub_test/build_package.py')

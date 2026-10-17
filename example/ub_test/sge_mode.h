@@ -51,6 +51,8 @@ inline bool ValidateUrmaSgeMode(const std::string& requested) {
     }
     std::cout << "UB_TEST_TRANSPORT sge_mode=" << actual
               << " max_sge=" << max_sge << " tp=CTP priority=" << priority
+              << " jfs_count=" << pool->io_jfs.size()
+              << " jfr_count=" << pool->io_jfr.size()
               << std::endl;
     return true;
 }

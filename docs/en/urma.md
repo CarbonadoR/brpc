@@ -10,7 +10,7 @@ for large-packet / cross-node scenarios (Route C, "double backend").
 ## Technical Background
 
 The pooled transport uses independent RM JFS/JFR objects and the CTP path.
-Each process shares 128 JFS slots and 64 JFR slots by default, with a separate
+Each process shares 48 JFS slots and 64 JFR slots by default, with a separate
 JFC/JFCE per slot. SEND uses `urma_post_jfs_wr`; receives use `urma_post_jfr_wr`.
 Only event mode is supported in this phase. Credit/ACK, polling, bonding and
 one-sided READ are outside the current scope.
@@ -124,6 +124,12 @@ runner in `example/ub_test/run_ub_test_matrix.py` still uses the two-mode shared
 library archive produced by the CMake-based `example/ub_test/build_package.py`;
 the Bazel targets build the benchmark programs independently.
 
+The matrix runner accepts `--io-jfs-count=48` to set the shared JFS count on
+both nodes and verify the actual count in their startup logs. Compare
+`--io-jfs-count=128` with `--io-jfs-count=48` to measure the effect of the send
+queue working set; omitting the option uses the library default. The option
+does not change QD, target QPS, message sizes, queue depths, or statistics.
+
 ## Usage
 
 Select the transport by setting `socket_mode` on the channel / server:
@@ -200,7 +206,7 @@ TLS caches is retained during initialization rollback.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--urma_io_jfs_cnt` | 128 | Process-wide send slots |
+| `--urma_io_jfs_cnt` | 48 | Process-wide send slots |
 | `--urma_io_jfr_cnt` | 64 | Shared receive slots |
 | `--urma_io_sq_depth` | 128 | Depth per JFS |
 | `--urma_io_rx_depth` | 512 | Depth per JFR |
@@ -322,7 +328,7 @@ On 2026-10-15, 17 cases totaling 142,820 RPCs passed between two aarch64 nodes
 using UMDK 25.12, `udmac0d1e2`, CTP and tcmalloc. Coverage included both
 directions, v2/v3 handshakes, 0–64KB attachments, the 4032/4033-byte boundary,
 both send-SGE modes and mixed-mode peers, concurrent single/pooled/short
-connections, and default 128-JFS/64-JFR as well as 4-JFS/2-JFR pools. Each
+connections, and the then-default 128-JFS/64-JFR as well as 4-JFS/2-JFR pools. Each
 send mode also completed 70,000 consecutive RPCs across sequence wraparound.
 
 These checks exposed and fixed the CTP total-length limit and shared
