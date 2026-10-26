@@ -36,7 +36,10 @@
 #include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma_transport.h"
 #include "brpc/server.h"
+#include "brpc/input_messenger.h"
+#include "brpc/input_message_base.h"
 #include "bthread/bthread.h"
+#include "bthread/unstable.h"
 #include "brpc/controller.h"
 #include "echo.pb.h"
 #include "urma_types.h"
@@ -709,6 +712,7 @@ protected:
             }
         }
     }
+    void CheckBlockingCallback();
     std::unique_ptr<RecordingPool> _pool;
     urma::UrmaResourcePool* _original{nullptr};
     std::vector<SocketUniquePtr> _sockets;
@@ -1381,7 +1385,7 @@ public:
     }
 };
 
-TEST_F(UrmaPooledTest, blocking_callback_does_not_block_another_connection_on_same_jfr) {
+void UrmaPooledTest::CheckBlockingCallback() {
     ASSERT_TRUE(_pool->Shutdown());
     _pool.reset();
     urma::g_urma_pool = _original;
@@ -1423,6 +1427,20 @@ TEST_F(UrmaPooledTest, blocking_callback_does_not_block_another_connection_on_sa
     worker.join();
     server.Stop(0);
     server.Join();
+}
+
+TEST_F(UrmaPooledTest, blocking_callback_does_not_block_another_connection_on_same_jfr) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_inline_last", "false").empty());
+    CheckBlockingCallback();
+}
+
+TEST_F(UrmaPooledTest, inline_callback_does_not_block_another_connection_on_same_jfr) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_inline_last", "true").empty());
+    CheckBlockingCallback();
 }
 
 TEST_F(UrmaPooledTest, disconnected_connections_release_server_sockets_and_imports) {
@@ -1475,6 +1493,130 @@ TEST_F(UrmaPooledTest, disconnected_connections_release_server_sockets_and_impor
     }
     server.Stop(0);
     server.Join();
+}
+
+// A whole shared CQ callback may retain only one parser-last message, even
+// when CQEs belong to different logical connections. Its callback must observe
+// the event counter released and every queue/endpoint lock unlocked.
+struct InlineDeliveryProbe {
+    struct Message : InputMessageBase {
+        explicit Message(char c) : value(c) {}
+        char value;
+        void DestroyImpl() override { delete this; }
+    };
+    Socket* carrier = nullptr;
+    SocketId last_socket = INVALID_SOCKET_ID;
+    urma::UrmaIoSlot* slot = nullptr;
+    bthread_t poller = 0;
+    bthread_key_t key;
+    int expected_tls = 123;
+    int cq_tls = 456;
+    std::atomic<int> next_thread{0};
+    bthread_t processing_threads[4]{};
+    std::atomic<int> processed{0};
+    std::atomic<int> inline_count{0};
+    static ParseResult Parse(butil::IOBuf* data, Socket*, bool, const void*) {
+        if (data->empty()) { return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA); }
+        char value;
+        data->cutn(&value, 1);
+        return MakeMessage(new Message(value));
+    }
+    static void Process(InputMessageBase* message) {
+        auto* probe = const_cast<InlineDeliveryProbe*>(
+            static_cast<const InlineDeliveryProbe*>(message->arg()));
+        const int index = probe->next_thread.fetch_add(1);
+        EXPECT_LT(index, 4);
+        if (index < 4) { probe->processing_threads[index] = bthread_self(); }
+        EXPECT_EQ(&probe->expected_tls, bthread_getspecific(probe->key));
+        if (bthread_self() == probe->poller) {
+            ++probe->inline_count;
+            EXPECT_EQ(probe->last_socket, message->socket()->id());
+            EXPECT_EQ('b', static_cast<Message*>(message)->value);
+            EXPECT_EQ(0, probe->carrier->_nevent.load());
+            auto* endpoint = static_cast<UrmaTransport*>(
+                message->socket()->_transport.get())->GetUrmaEp();
+            for (auto* mutex : {&probe->slot->mutex, &endpoint->_dispatch_mutex,
+                                &endpoint->_reorder_mutex}) {
+                const bool unlocked = mutex->try_lock();
+                EXPECT_TRUE(unlocked);
+                if (unlocked) { mutex->unlock(); }
+            }
+        }
+        message->Destroy();
+        ++probe->processed;
+    }
+};
+
+TEST_F(UrmaPooledTest, inline_batch_releases_locks_and_event_once_for_all_connections) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_inline_last", "true");
+    InlineDeliveryProbe probe;
+    // Keep one worker from taking all eight pre-reserved tables into its
+    // pthread-local cache before the other message workers can borrow one.
+    GFLAGS_NAMESPACE::SetCommandLineOption("borrow_from_globle_size", "1");
+    bthread_keytable_pool_t key_pool;
+    ASSERT_EQ(0, bthread_keytable_pool_init(&key_pool));
+    ASSERT_EQ(0, bthread_key_create(&probe.key, nullptr));
+    bthread_keytable_pool_reserve(&key_pool, 8, probe.key,
+        [](const void* p) -> void* { return const_cast<void*>(p); }, &probe.expected_tls);
+    InputMessenger messenger;
+    InputMessageHandler handler = {InlineDeliveryProbe::Parse,
+        InlineDeliveryProbe::Process, nullptr, &probe, "inline-probe"};
+    ASSERT_EQ(0, messenger.AddNonProtocolHandler(handler));
+    SocketOptions carrier_options;
+    probe.slot = _pool->io_jfr[0];
+    carrier_options.user = probe.slot;
+    probe.slot->AddRef();
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(carrier_options, &id));
+    SocketUniquePtr carrier;
+    ASSERT_EQ(0, Socket::Address(id, &carrier));
+    probe.carrier = carrier.get();
+    probe.poller = bthread_self();
+    carrier->_nevent.store(1);
+    for (int connection = 0; connection < 2; ++connection) {
+        auto* sender = Endpoint();
+        auto* receiver = Endpoint();
+        ASSERT_TRUE(sender && receiver);
+        receiver->_socket->_user = &messenger;
+        receiver->_socket->_keytable_pool = &key_pool;
+        probe.last_socket = receiver->_socket->id();
+        receiver->_state = urma::UrmaEndpoint::ESTABLISHED;
+        Connect(sender, receiver);
+        // Two parsed messages per CQE: the first stays asynchronous.
+        butil::IOBuf data;
+        data.append("ab", 2);
+        butil::IOBuf* list[] = {&data};
+        ASSERT_EQ(2, sender->CutFromIOBufList(list, 1));
+    }
+    bthread_t poll_thread;
+    ASSERT_EQ(0, bthread_start_background(&poll_thread, nullptr,
+        [](void* p) -> void* {
+            auto* probe = static_cast<InlineDeliveryProbe*>(p);
+            probe->poller = bthread_self();
+            EXPECT_EQ(0, bthread_setspecific(probe->key, &probe->cq_tls));
+            urma::UrmaEndpoint::PollIoJfc(probe->carrier);
+            EXPECT_EQ(&probe->cq_tls, bthread_getspecific(probe->key));
+            return nullptr;
+        }, &probe));
+    ASSERT_EQ(0, bthread_join(poll_thread, nullptr));
+    const int64_t deadline = butil::monotonic_time_us() + 2000000;
+    while (probe.processed != 4 && butil::monotonic_time_us() < deadline) {
+        usleep(1000);
+    }
+    EXPECT_EQ(4, probe.processed.load());
+    EXPECT_EQ(1, probe.inline_count.load());
+    for (bthread_t thread : probe.processing_threads) {
+        if (thread && thread != probe.poller) { EXPECT_EQ(0, bthread_join(thread, nullptr)); }
+    }
+    for (auto& socket : _sockets) {
+        socket->_user = nullptr;
+        socket->_keytable_pool = nullptr;
+    }
+    ASSERT_EQ(0, bthread_keytable_pool_destroy(&key_pool));
+    ASSERT_EQ(0, bthread_key_delete(probe.key));
+    carrier->SetFailed();
+    DrainTx();
 }
 
 #else  // BRPC_WITH_URMA

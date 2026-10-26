@@ -41,10 +41,12 @@
 #include "butil/time.h"
 #include "bthread/bthread.h"
 #include "bthread/butex.h"
+#include "bthread/task_group.h"
 
 #include "urma_api.h"
 
 #include "brpc/input_messenger.h"
+#include "brpc/input_message_base.h"
 #include "brpc/socket.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
@@ -52,8 +54,91 @@
 #include "brpc/urma_transport.h"
 
 
+namespace bthread {
+EXTERN_BAIDU_VOLATILE_THREAD_LOCAL(TaskGroup*, tls_task_group);
+// Same internal cleanup primitive used by TaskGroup::task_runner.
+extern void return_keytable(bthread_keytable_pool_t*, KeyTable*);
+}
+
 namespace brpc {
 namespace urma {
+namespace {
+// A shared CQ carrier has no per-server keytable pool. Give its one inline
+// message the same fresh bthread-local context as QueueMessage would create.
+// Keep the CQ context intact, including when authentication has used TLS.
+class ScopedMessageLocalStorage {
+public:
+    explicit ScopedMessageLocalStorage(bthread_keytable_pool_t* pool)
+        : _saved(*bthread::tls_bls_ptr()), _pool(pool) {
+        auto* group = bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+        _task = group ? group->current_task() : nullptr;
+        if (_task) {
+            BAIDU_SCOPED_LOCK(_task->version_lock);
+            _old_pool = _task->attr.keytable_pool;
+            _task->attr.keytable_pool = pool;
+            _task->local_storage = bthread::LOCAL_STORAGE_INIT;
+        }
+        *bthread::tls_bls_ptr() = bthread::LOCAL_STORAGE_INIT;
+    }
+    ~ScopedMessageLocalStorage() {
+        // Destructors may yield: reload TLS pointers after each callback.
+        auto* local = bthread::tls_bls_ptr();
+        if (local->rpcz_parent_span && bthread::g_rpcz_parent_span_dtor) {
+            bthread::g_rpcz_parent_span_dtor(local->rpcz_parent_span);
+            bthread::tls_bls_ptr()->rpcz_parent_span = nullptr;
+            if (_task) { _task->local_storage.rpcz_parent_span = nullptr; }
+        }
+        bthread::return_keytable(_pool, bthread::tls_bls_ptr()->keytable);
+        *bthread::tls_bls_ptr() = _saved;
+        if (_task) {
+            BAIDU_SCOPED_LOCK(_task->version_lock);
+            _task->attr.keytable_pool = _old_pool;
+            _task->local_storage = _saved;
+        }
+    }
+private:
+    bthread::LocalStorage _saved;
+    bthread::TaskMeta* _task;
+    bthread_keytable_pool_t* _pool;
+    bthread_keytable_pool_t* _old_pool{nullptr};
+};
+}  // namespace
+
+
+UrmaDeferredMessage::~UrmaDeferredMessage() noexcept(false) {
+    if (!message) { return; }
+    // Errors may terminate the CQ drain before it hands event ownership back.
+    // Never run business code in that case; fail and destroy outside locks.
+    if (!event_released || message->socket()->Failed()) {
+        if (!event_released) {
+            message->socket()->SetFailed(EIO, "URMA CQ stopped before message delivery");
+        }
+        message->Destroy();
+        return;
+    }
+    if (!bthread_self() ||
+        !bthread::BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group)) {
+        // A raw pthread cannot borrow a bthread keytable pool. Preserve the
+        // normal dispatch context for this uncommon direct-callback path.
+        bthread_t thread;
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        attr.keytable_pool = message->socket()->keytable_pool();
+        attr.tag = bthread_self_tag();
+        if (bthread_start_background(&thread, &attr,
+                                    Transport::ProcessInputMessage, message) != 0) {
+            // Existing dispatch fallback, now outside the CQ locks.
+            InputMessageClosure run;
+            run.reset(message);
+        }
+        return;
+    }
+    ScopedMessageLocalStorage local(message->socket()->keytable_pool());
+    InputMessageClosure run;
+    run.reset(message);
+}
+
+DEFINE_bool(urma_inline_last, true,
+            "Process one URMA message inline after CQ event release (startup only)");
 
 // Flags used here are declared in urma_endpoint.h (urma_use_polling,
 // urma_poller_num, urma_disable_bthread). Declare the rest here.
@@ -492,7 +577,8 @@ void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
     }
 }
 
-void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr) {
+void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
+                                      UrmaDeferredMessage* deferred) {
     auto* raw = reinterpret_cast<RxRecvCtx*>(cr.user_ctx);
     if (!raw || slot->pending.erase(raw) != 1) {
         LOG(ERROR) << "Unknown URMA RX completion context";
@@ -534,11 +620,12 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr) {
         if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }
         return;
     }
-    if (ep) { ep->ReorderAndDispatch(socket, seq, std::move(data)); }
+    if (ep) { ep->ReorderAndDispatch(socket, seq, std::move(data), deferred); }
 }
 
 void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
-                                      butil::IOBuf data) {
+                                      butil::IOBuf data,
+                                      UrmaDeferredMessage* deferred) {
     BAIDU_SCOPED_LOCK(_reorder_mutex);
     BAIDU_SCOPED_LOCK(_dispatch_mutex);
     const State state = _state.load(butil::memory_order_acquire);
@@ -563,15 +650,17 @@ void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
         _reorder_queue.erase(it);
         ++_deliver_base;
     }
-    DispatchReceivedBytesLocked(socket, bytes);
+    DispatchReceivedBytesLocked(socket, bytes, deferred);
 }
 
-void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& socket, ssize_t bytes) {
+void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& socket, ssize_t bytes,
+                                         UrmaDeferredMessage* deferred) {
     BAIDU_SCOPED_LOCK(_dispatch_mutex);
-    DispatchReceivedBytesLocked(socket, bytes);
+    DispatchReceivedBytesLocked(socket, bytes, deferred);
 }
 void UrmaEndpoint::DispatchReceivedBytesLocked(SocketUniquePtr& socket,
-                                               ssize_t bytes) {
+                                               ssize_t bytes,
+                                               UrmaDeferredMessage* deferred) {
     if (bytes > 0) { _pending_received_bytes.fetch_add(bytes); }
     if (_state.load(butil::memory_order_acquire) != ESTABLISHED || socket->Failed()) {
         return;
@@ -580,8 +669,10 @@ void UrmaEndpoint::DispatchReceivedBytesLocked(SocketUniquePtr& socket,
     if (pending <= 0 || !socket->user()) { return; }
     const int64_t now = butil::cpuwide_time_us();
     InputMessageClosure last_msg;
+    _deferred_message = deferred;
     _input_processor.ProcessNewMessage(pending, false, now,
         butil::gettimeofday_us() - now, last_msg);
+    _deferred_message = nullptr;
 }
 
 int UrmaEndpoint::AttachSlotSocket(UrmaIoSlot* slot) {
@@ -615,6 +706,8 @@ void UrmaEndpoint::DetachSlotSocket(UrmaIoSlot* slot) {
     slot->jfc_sid = INVALID_SOCKET_ID;
 }
 void UrmaEndpoint::PollIoJfc(Socket* carrier) {
+    UrmaDeferredMessage deferred;
+    UrmaDeferredMessage* delivery = FLAGS_urma_inline_last ? &deferred : nullptr;
     auto* slot = static_cast<UrmaIoSlot*>(carrier->user());
     BAIDU_SCOPED_LOCK(slot->mutex);
     if (slot->stopped.load()) { return; }
@@ -629,7 +722,7 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
                 if (slot->type == UrmaIoSlot::JFS_SLOT) {
                     HandleTxCompletion(static_cast<UrmaJfsSlot*>(slot), cr[i]);
                 } else {
-                    HandleRxCompletion(static_cast<UrmaJfrSlot*>(slot), cr[i]);
+                    HandleRxCompletion(static_cast<UrmaJfrSlot*>(slot), cr[i], delivery);
                 }
             }
         }
@@ -654,7 +747,10 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
             }
             continue;
         }
-        if (!carrier->MoreReadEvents(&progress)) { return; }
+        if (!carrier->MoreReadEvents(&progress)) {
+            deferred.event_released = true;
+            return;
+        }
     }
 }
 

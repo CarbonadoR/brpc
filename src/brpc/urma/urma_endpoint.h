@@ -49,6 +49,18 @@ namespace urma {
 class UrmaHandshake;
 struct ParsedHello;
 
+// Callback-owned, bounded to one message across all logical connections.
+// Declare before the CQ lock so destruction always happens after unlocking.
+struct UrmaDeferredMessage {
+    UrmaDeferredMessage() = default;
+    InputMessageBase* message{nullptr};
+    bool event_released{false};
+    ~UrmaDeferredMessage() noexcept(false);
+private:
+    DISALLOW_COPY_AND_ASSIGN(UrmaDeferredMessage);
+};
+
+DECLARE_bool(urma_inline_last);
 DECLARE_bool(urma_use_polling);
 DECLARE_int32(urma_poller_num);
 DECLARE_bool(urma_disable_bthread);
@@ -80,7 +92,7 @@ private:
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
     friend class UrmaConnect;
     friend class Socket;
-    friend class UrmaTransport;
+    friend class ::brpc::UrmaTransport;
     friend class UrmaHandshakeClientV2;
     friend class UrmaHandshakeServerV2;
     friend class UrmaHandshakeClientV3;
@@ -126,7 +138,8 @@ public:
     static int AttachSlotSocket(UrmaIoSlot*);
     static void DetachSlotSocket(UrmaIoSlot*);
     static void HandleTxCompletion(UrmaJfsSlot*, const urma_cr_t&);
-    static void HandleRxCompletion(UrmaJfrSlot*, const urma_cr_t&);
+    static void HandleRxCompletion(UrmaJfrSlot*, const urma_cr_t&,
+                                   UrmaDeferredMessage* = nullptr);
 
     // Compatibility entry points; polling mode currently returns ENOTSUP.
     static int PollingModeInitialize(bthread_tag_t tag,
@@ -195,15 +208,18 @@ private:
     // Returns 0 on success.
     int ImportPeer(const ParsedHello& peer);
 
-    void ReorderAndDispatch(SocketUniquePtr&, uint16_t seq, butil::IOBuf data);
-    void DispatchReceivedBytesLocked(SocketUniquePtr&, ssize_t bytes);
+    void ReorderAndDispatch(SocketUniquePtr&, uint16_t seq, butil::IOBuf data,
+                            UrmaDeferredMessage* = nullptr);
+    void DispatchReceivedBytesLocked(SocketUniquePtr&, ssize_t bytes,
+                                     UrmaDeferredMessage* = nullptr);
 
     // Queue received bytes for InputMessenger. CQ receive completions can
     // arrive while the server is still waiting for the final TCP handshake
     // ACK. Keep those bytes in the URMA input processor and dispatch them only
     // after ESTABLISHED, matching the connection-ready boundary seen by user
     // code.
-    void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes);
+    void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes,
+                               UrmaDeferredMessage* = nullptr);
 
     inline void TryReadOnTcp();
     void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
@@ -223,6 +239,8 @@ private:
     int _handshake_version{0};  // 0 = unnegotiated; 2 = v2; 3 = v3
     butil::atomic<int64_t> _pending_received_bytes{0};
     butil::Mutex _dispatch_mutex;
+    // Only valid during ProcessNewMessage, protected by _dispatch_mutex.
+    UrmaDeferredMessage* _deferred_message{nullptr};
 
     std::shared_ptr<UrmaConnResource> _conn_res;
     SocketId _self_socket_id{INVALID_SOCKET_ID};

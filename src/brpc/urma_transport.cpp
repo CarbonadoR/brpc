@@ -160,10 +160,27 @@ void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
 }
 
 void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
-                                 int* num_bthread_created, bool /*last_msg*/) {
+                                 int* num_bthread_created, bool last_msg) {
+    // Keep only the newest parser-last message across the shared CQ callback.
+    // Superseded messages retain their own socket's dispatch attributes. This
+    // lets older candidates progress as more complete messages arrive.
+    auto* deferred = last_msg && _urma_ep ? _urma_ep->_deferred_message : nullptr;
+    if (deferred && !FLAGS_usercode_in_pthread) {
+        InputMessageBase* current = input_msg.release();
+        if (!current) { return; }
+        InputMessageBase* displaced = deferred->message;
+        InputMessageClosure previous;
+        previous.reset(displaced);
+        deferred->message = current;
+        if (displaced) {
+            displaced->socket()->_transport->QueueMessage(
+                previous, num_bthread_created, false);
+        }
+        return;
+    }
     // A shared receive CQ must keep replenishing buffers even when an RPC
     // callback blocks (including a response waiting on the shared SQ).
-    // Dispatch the last parsed message too, rather than running it inline.
+    // Without deferred delivery, queue the last parsed message as well.
     InputMessageBase* to_run_msg = input_msg.release();
     if (!to_run_msg) {
         return;

@@ -288,6 +288,7 @@ CTP 每条 SEND 的总长度上限为 4096B，包含 64B header，因此两种�
 | `--urma_buffer_count` | 48000 | 数据块数量 |
 | `--urma_memory_pool_limit_mb` | 400 | data + header 注册池容量上限，单位 MiB |
 | `--urma_cqe_poll_once` | 32 | 每次 poll 上限，实际限制在 1–32 |
+| `--urma_inline_last` | true | CQ 事件交接后在当前 bthread 处理一条消息；仅启动时配置 |
 | `--urma_recv_zerocopy` | true | 启用接收零拷贝 |
 | `--urma_zerocopy_min_size` | 512 | 小于阈值的消息拷贝到读缓冲区 |
 | `--urma_device` | 空 | 指定设备，否则选第一个 |
@@ -300,8 +301,14 @@ header 数量至少覆盖所有 RX 和 TX slot 深度之和，数据块数量须
 初始化拒绝，容量不会随连接数增加。池元数据、tcmalloc 堆、Socket、线程栈、
 驱动队列和应用数据不属于这项注册池预算，应另外记录进程 RSS。
 旧的 `urma_sq_size`、`urma_rq_size`、`urma_prepared_jetty_cnt` 不再控制资源；
-改用上表中的池化参数。`urma_disable_bthread` 已弃用，共享 CQ 总是将
-RPC 回调交给 bthread，避免阻塞同一 JFR 上其他连接的接收补投。`urma_use_polling=true` 和 bonding 设备当前明确拒绝。
+改用上表中的池化参数。`urma_disable_bthread` 已弃用。默认每次共享 CQ 回调
+最多保留一条已解析消息，完成补收、事件通知处理和事件所有权交接，释放
+CQ 及端点锁之后，再在当前 bthread 执行。其余消息异步调度；保留的消息使用
+其逻辑连接的 keytable pool，并隔离和恢复 CQ 的 bthread 本地状态。业务回调
+阻塞时，后续 CQ 事件仍可由其他 bthread 接手。设置 `--urma_inline_last=false`
+可恢复全部异步调度；`usercode_in_pthread` 模式保持异步调度。该优化不改变
+共享资源数量、线格式和接收重排。持续无法排空的 CQ 可能延后保留消息的执行，
+当前没有为饱和负载增加排空预算。`urma_use_polling=true` 和 bonding 设备当前明确拒绝。
 
 ## 4 万连接压力验证
 

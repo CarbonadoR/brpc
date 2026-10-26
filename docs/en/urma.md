@@ -215,6 +215,7 @@ TLS caches is retained during initialization rollback.
 | `--urma_buffer_count` | 48000 | Registered data blocks |
 | `--urma_memory_pool_limit_mb` | 400 | Combined registered data/header budget in MiB |
 | `--urma_cqe_poll_once` | 32 | CQ batch size, clamped to 1–32 |
+| `--urma_inline_last` | true | Process one message in the current bthread after CQ event handoff; startup only |
 | `--urma_recv_zerocopy` | true | Enable zero-copy receive |
 | `--urma_zerocopy_min_size` | 512 | Copy smaller receives |
 | `--urma_device` | empty | Device name; empty selects the first |
@@ -229,10 +230,19 @@ the budget; registered capacity does not grow with connection count. This
 budget excludes pool metadata, tcmalloc heap, sockets, stacks, provider queues,
 and application data. Measure process RSS separately. The old `urma_sq_size`,
 `urma_rq_size`, and `urma_prepared_jetty_cnt` flags are deprecated and no
-longer size resources. `urma_disable_bthread` is also deprecated: shared CQs
-dispatch every RPC callback to bthreads so a blocked callback cannot prevent
-receive replenishment on other connections. Polling and bonding configurations
-are rejected.
+longer size resources. `urma_disable_bthread` is also deprecated. By default,
+a shared CQ callback retains at most one parsed message. After receive
+replenishment, notification handling, event ownership handoff, and release of
+all CQ and endpoint locks, it executes that message in the current bthread.
+Other messages are dispatched asynchronously. The retained message uses its
+logical socket's keytable pool, with fresh bthread-local storage; the CQ's local
+state is restored afterward. Other bthreads can handle later CQ events while
+the business callback blocks. Set `--urma_inline_last=false` to restore fully
+asynchronous dispatch. `usercode_in_pthread` stays asynchronous. Resource
+sharing, wire format, and receive ordering remain unchanged. A continuously
+nonempty CQ can delay the retained message; this change does not introduce a
+drain budget for saturated workloads. Polling and bonding configurations are
+rejected.
 
 ## 40,000-connection stress test
 
