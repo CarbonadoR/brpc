@@ -450,17 +450,19 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         ctx->jfs_index = slot->index;
         ctx->connection = _conn_res;
         ctx->seq = _next_send_seq;
-        ctx->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
         auto fail = [&](int error) -> ssize_t {
             slot->sq_inflight.fetch_sub(1);
             errno = error;
             return total ? total : -1;
         };
+#if !BRPC_URMA_SINGLE_SGE
+        ctx->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
         if (!ctx->header_buf) { return fail(ENOMEM); }
         std::memset(ctx->header_buf, 0, sizeof(UrmaMsgHeader));
         ctx->header_buf->dst_socket_id = butil::HostToNet64(_peer_socket_id);
         ctx->header_buf->seq = butil::HostToNet16(ctx->seq);
         ctx->header_buf->type = MSG_SMALL;
+#endif
         size_t limit = std::min<size_t>(_remote_recv_block_size, GetUrmaRecvBlockSize());
         limit = std::min(limit, URMA_CTP_MAX_MESSAGE_SIZE - sizeof(UrmaMsgHeader));
 #if BRPC_URMA_SINGLE_SGE
@@ -482,7 +484,12 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                 size < static_cast<int>(sizeof(UrmaMsgHeader) + limit)) {
                 return fail(ENOMEM);
             }
-            std::memcpy(wire, ctx->header_buf, sizeof(UrmaMsgHeader));
+            ctx->header_buf = static_cast<UrmaMsgHeader*>(wire);
+            ctx->header_in_send_data = true;
+            std::memset(ctx->header_buf, 0, sizeof(UrmaMsgHeader));
+            ctx->header_buf->dst_socket_id = butil::HostToNet64(_peer_socket_id);
+            ctx->header_buf->seq = butil::HostToNet16(ctx->seq);
+            ctx->header_buf->type = MSG_SMALL;
             // Input block boundaries do not consume SGEs in the copying mode.
             for (size_t j = i; j < ndata && len < limit; ++j) {
                 len += from[j]->copy_to(

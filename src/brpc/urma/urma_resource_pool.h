@@ -91,7 +91,12 @@ struct TxCompletionCtx {
     std::shared_ptr<UrmaConnResource> connection;
     uint16_t seq{0};
     uint8_t type{MSG_SMALL};
-    ~TxCompletionCtx() { FreeHeaderBuffer(header_buf); }
+    bool header_in_send_data{false};
+    ~TxCompletionCtx() {
+        // In single-SGE builds header_buf points into send_data, which owns
+        // the complete registered wire buffer until this completion.
+        if (!header_in_send_data) { FreeHeaderBuffer(header_buf); }
+    }
 };
 struct RxRecvCtx {
     UrmaMsgHeader* header_buf{nullptr};

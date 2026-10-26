@@ -1161,6 +1161,43 @@ TEST_F(UrmaPooledTest, receive_reposting_preserves_delivered_buffers) {
     }
 }
 
+TEST_F(UrmaPooledTest, single_sge_header_uses_owned_wire_buffer) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    std::vector<void*> held_headers;
+    while (void* header = urma::AllocHeaderBuffer()) {
+        held_headers.push_back(header);
+    }
+    butil::IOBuf data;
+    data.append("body");
+    butil::IOBuf* input[] = {&data};
+    const ssize_t sent = sender->CutFromIOBufList(input, 1);
+#if BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ(4, sent);
+    EXPECT_TRUE(data.empty());
+    for (const auto* slot : _pool->io_jfs) {
+        for (const auto* ctx : slot->pending) {
+            EXPECT_EQ(ctx->send_data.fetch1(),
+                      static_cast<const void*>(ctx->header_buf));
+            EXPECT_NE(nullptr, urma::GetPoolSegFor(ctx->header_buf));
+            EXPECT_EQ(nullptr, urma::GetHeaderPoolSegFor(ctx->header_buf));
+        }
+    }
+#else
+    EXPECT_EQ(-1, sent);
+    EXPECT_EQ("body", data.to_string());
+#endif
+    for (void* header : held_headers) { urma::FreeHeaderBuffer(header); }
+    DrainTx();
+    DrainRx();
+#if BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ("body", receiver->_input_processor.read_buf().to_string());
+#endif
+}
+
 TEST_F(UrmaPooledTest, failed_repost_keeps_context_owned_until_shutdown) {
     auto* sender = Endpoint();
     auto* receiver = Endpoint();
