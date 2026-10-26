@@ -198,35 +198,49 @@ int UrmaResourcePool::PostRecvToSlot(UrmaJfrSlot& slot, uint32_t num) {
         context->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
         if (!context->header_buf) { errno = ENOMEM; return -1; }
         std::memset(context->header_buf, 0, sizeof(UrmaMsgHeader));
-        const size_t block_size = GetUrmaRecvBlockSize();
-        // Destroy the stream BEFORE publishing the context: its destructor
-        // may still access the IOBuf, and a CQE can arrive immediately.
-        {
-            butil::IOBufAsZeroCopyOutputStream stream(
-                &context->data_iobuf, block_size + sizeof(butil::IOBuf::Block));
-            int size = 0;
-            if (!stream.Next(&context->data_block, &size) ||
-                size < static_cast<int>(block_size)) { errno = ENOMEM; return -1; }
-        }
-        urma_sge_t sge[2]{};
-        sge[0].addr = reinterpret_cast<uint64_t>(context->header_buf);
-        sge[0].len = sizeof(UrmaMsgHeader);
-        sge[0].tseg = GetHeaderPoolSegFor(context->header_buf);
-        sge[1].addr = reinterpret_cast<uint64_t>(context->data_block);
-        sge[1].len = block_size;
-        sge[1].tseg = GetPoolSegFor(context->data_block);
-        if (!sge[0].tseg || !sge[1].tseg) { errno = ERDMAMEM; return -1; }
-        urma_jfr_wr_t wr{};
-        wr.src = urma_sg_t{sge, 2};
-        wr.user_ctx = reinterpret_cast<uint64_t>(context.get());
-        urma_jfr_wr_t* bad = nullptr;
         slot.pending.insert(context.get());
-        if (urma_post_jfr_wr(slot.jfr, &wr, &bad) != URMA_SUCCESS) {
+        if (RepostRecv(slot, context.get()) != 0) {
             slot.pending.erase(context.get());
-            errno = EIO;
             return -1;
         }
         context.release();
+    }
+    return 0;
+}
+
+int UrmaResourcePool::RepostRecv(UrmaJfrSlot& slot, RxRecvCtx* context) {
+    const size_t block_size = GetUrmaRecvBlockSize();
+    if (!context->data_block) {
+        // Finish the stream before the WR becomes visible to the provider.
+        int size = 0;
+        bool allocated = false;
+        {
+            butil::IOBufAsZeroCopyOutputStream stream(
+                &context->data_iobuf, block_size + sizeof(butil::IOBuf::Block));
+            allocated = stream.Next(&context->data_block, &size);
+        }
+        if (!allocated || size < static_cast<int>(block_size)) {
+            context->data_block = nullptr;
+            context->data_iobuf.clear();
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    urma_sge_t sge[2]{};
+    sge[0].addr = reinterpret_cast<uint64_t>(context->header_buf);
+    sge[0].len = sizeof(UrmaMsgHeader);
+    sge[0].tseg = GetHeaderPoolSegFor(context->header_buf);
+    sge[1].addr = reinterpret_cast<uint64_t>(context->data_block);
+    sge[1].len = block_size;
+    sge[1].tseg = GetPoolSegFor(context->data_block);
+    if (!sge[0].tseg || !sge[1].tseg) { errno = ERDMAMEM; return -1; }
+    urma_jfr_wr_t wr{};
+    wr.src = urma_sg_t{sge, 2};
+    wr.user_ctx = reinterpret_cast<uint64_t>(context);
+    urma_jfr_wr_t* bad = nullptr;
+    if (urma_post_jfr_wr(slot.jfr, &wr, &bad) != URMA_SUCCESS) {
+        errno = EIO;
+        return -1;
     }
     return 0;
 }

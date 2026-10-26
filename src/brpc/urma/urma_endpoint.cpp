@@ -580,12 +580,12 @@ void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
 void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
                                       UrmaDeferredMessage* deferred) {
     auto* raw = reinterpret_cast<RxRecvCtx*>(cr.user_ctx);
-    if (!raw || slot->pending.erase(raw) != 1) {
+    if (!raw || slot->pending.count(raw) != 1) {
         LOG(ERROR) << "Unknown URMA RX completion context";
         slot->stopped.store(true);
         return;
     }
-    std::unique_ptr<RxRecvCtx> ctx(raw);
+    RxRecvCtx* ctx = raw;
     SocketUniquePtr socket;
     UrmaEndpoint* ep = nullptr;
     uint16_t seq = 0;
@@ -606,15 +606,19 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
                 if (FLAGS_urma_recv_zerocopy &&
                     len >= static_cast<size_t>(FLAGS_urma_zerocopy_min_size)) {
                     ctx->data_iobuf.cutn(&data, len);
+                    // The application now owns this block. Refill this shared
+                    // receive slot with a new block before accepting more DMA.
+                    ctx->data_iobuf.clear();
+                    ctx->data_block = nullptr;
                 } else {
                     data.append(ctx->data_block, len);
                 }
             }
         }
     }
-    // Reclaim before reposting so an exactly sized header pool also works.
-    ctx.reset();
-    if (g_urma_pool->PostRecvToSlot(*slot, 1) != 0) {
+    // Context/header ownership stays with the shared slot until shutdown.
+    // Copy receives can reuse the data block; zero-copy receives replace it.
+    if (g_urma_pool->RepostRecv(*slot, ctx) != 0) {
         slot->stopped.store(true);
         LOG(ERROR) << "Failed to replenish shared URMA JFR " << slot->index;
         if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }

@@ -155,6 +155,9 @@ public:
     virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*);
     // Caller holds slot.mutex when invoked by the completion handler.
     virtual int PostRecvToSlot(UrmaJfrSlot&, uint32_t num);
+    // Reuse a completed receive context under slot.mutex. On failure it remains
+    // owned by slot.pending, so shutdown still controls the DMA lifetime.
+    virtual int RepostRecv(UrmaJfrSlot&, RxRecvCtx*);
     std::vector<UrmaJfsSlot*> io_jfs;
     std::vector<UrmaJfrSlot*> io_jfr;
     std::atomic<uint32_t> jfs_rr_counter{0};

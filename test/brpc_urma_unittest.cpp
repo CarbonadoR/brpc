@@ -631,6 +631,15 @@ protected:
             }
             return rc;
         }
+        int RepostRecv(urma::UrmaJfrSlot& slot, urma::RxRecvCtx* ctx) override {
+            if (fail_next_repost) {
+                fail_next_repost = false;
+                errno = ENOMEM;
+                return -1;
+            }
+            return UrmaResourcePool::RepostRecv(slot, ctx);
+        }
+        bool fail_next_repost{false};
         std::vector<std::vector<urma_sge_t>> sends;
     };
     void AppendBlock(butil::IOBuf* data, size_t len, char value) {
@@ -1124,6 +1133,56 @@ TEST_F(UrmaPooledTest, duplicate_sequence_fails_connection) {
     ep->ReorderAndDispatch(socket, 1, data);
     ep->ReorderAndDispatch(socket, 1, data);
     EXPECT_TRUE(socket->Failed());
+}
+
+TEST_F(UrmaPooledTest, receive_reposting_preserves_delivered_buffers) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    auto* slot = _pool->io_jfr[0];
+    const auto contexts = slot->pending;
+    std::string expected;
+    // Cycle every receive slot several times while the reader retains all
+    // earlier data. Alternate copied and zero-copy receives.
+    for (int i = 0; i < 32; ++i) {
+        const std::string packet(i % 2 ? 1024 : 16, 'a' + i % 26);
+        butil::IOBuf data;
+        data.append(packet);
+        butil::IOBuf* input[] = {&data};
+        ASSERT_EQ(static_cast<ssize_t>(packet.size()),
+                  sender->CutFromIOBufList(input, 1));
+        DrainTx();
+        DrainRx();
+        expected += packet;
+        EXPECT_EQ(expected, receiver->_input_processor.read_buf().to_string());
+        EXPECT_EQ(contexts, slot->pending);
+    }
+}
+
+TEST_F(UrmaPooledTest, failed_repost_keeps_context_owned_until_shutdown) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(receiver->_self_socket_id, &socket));
+    auto* slot = _pool->io_jfr[0];
+    const auto contexts = slot->pending;
+    butil::IOBuf data;
+    data.append(std::string(1024, 'x'));
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(1024, sender->CutFromIOBufList(input, 1));
+    _pool->fail_next_repost = true;
+    DrainRx();
+    EXPECT_TRUE(socket->Failed());
+    EXPECT_TRUE(slot->stopped.load());
+    EXPECT_EQ(contexts, slot->pending);
+    DrainTx();
+    ASSERT_TRUE(_pool->Shutdown());
+    EXPECT_TRUE(slot->pending.empty());
 }
 
 TEST_F(UrmaPooledTest, concurrent_sq_reservations_do_not_exceed_depth) {
