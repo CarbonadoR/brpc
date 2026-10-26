@@ -639,13 +639,24 @@ void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
     const uint16_t distance = static_cast<uint16_t>(seq - _deliver_base);
     // A 16-bit sequence can only order the forward half of its space. Never
     // silently overwrite a duplicate or append stale data to the stream.
-    if (distance >= 32768 || _reorder_queue.count(seq)) {
+    if (distance >= 32768) {
         socket->SetFailed(EPROTO, "Invalid/duplicate URMA sequence %u base=%u",
                            seq, _deliver_base);
         return;
     }
-    _reorder_queue.emplace(seq, std::move(data));
-    ssize_t bytes = 0;
+    if (distance != 0) {
+        if (!_reorder_queue.emplace(seq, std::move(data)).second) {
+            socket->SetFailed(EPROTO, "Duplicate URMA sequence %u base=%u",
+                              seq, _deliver_base);
+        }
+        return;
+    }
+    // Most completions already match the next stream position. Keep the
+    // ordered path allocation-free; only gaps need a map node. The same locks
+    // still serialize reset, handshake dispatch, and arrivals from other JFSs.
+    ssize_t bytes = data.size();
+    _input_processor.read_buf().append(data);
+    ++_deliver_base;
     // Lookup the expected key, not map.begin(): numeric sort is wrong at wrap.
     for (auto it = _reorder_queue.find(_deliver_base);
          it != _reorder_queue.end(); it = _reorder_queue.find(_deliver_base)) {

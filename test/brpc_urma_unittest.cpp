@@ -1185,6 +1185,34 @@ TEST_F(UrmaPooledTest, failed_repost_keeps_context_owned_until_shutdown) {
     EXPECT_TRUE(slot->pending.empty());
 }
 
+TEST_F(UrmaPooledTest, ordered_receive_drains_gap_across_sequence_wrap) {
+    auto* ep = Endpoint();
+    ASSERT_NE(nullptr, ep);
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(ep->_self_socket_id, &socket));
+    ep->_deliver_base = 65535;
+    auto receive = [&](uint16_t seq, const char* text) {
+        butil::IOBuf data;
+        data.append(text);
+        ep->ReorderAndDispatch(socket, seq, std::move(data));
+    };
+    receive(65535, "a");
+    EXPECT_TRUE(ep->_reorder_queue.empty());
+    EXPECT_EQ(0u, ep->_deliver_base);
+    receive(1, "c");
+    EXPECT_EQ("a", ep->_input_processor.read_buf().to_string());
+    ASSERT_EQ(1u, ep->_reorder_queue.size());
+    receive(0, "b");
+    EXPECT_EQ("abc", ep->_input_processor.read_buf().to_string());
+    EXPECT_TRUE(ep->_reorder_queue.empty());
+    EXPECT_EQ(2u, ep->_deliver_base);
+    EXPECT_FALSE(socket->Failed());
+    // A duplicate of a directly delivered packet must still fail.
+    receive(0, "duplicate");
+    EXPECT_TRUE(socket->Failed());
+    EXPECT_EQ("abc", ep->_input_processor.read_buf().to_string());
+}
+
 TEST_F(UrmaPooledTest, concurrent_sq_reservations_do_not_exceed_depth) {
     std::atomic<int> acquired{0};
     std::vector<std::thread> threads;
