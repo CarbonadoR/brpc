@@ -157,6 +157,11 @@ public:
     virtual UrmaJfsSlot* AcquireJfs();
     virtual uint32_t PickJfr();
     bool IsWritable() const;
+    // Wait on the calling Socket's butex, but register for pool-wide SQ space.
+    int WaitWritable(butil::atomic<int>* butex, int expected,
+                     const timespec* deadline);
+    // Every returned reservation, including post failures, may unblock peers.
+    void ReleaseJfs(UrmaJfsSlot* slot);
     virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*);
     // Caller holds slot.mutex when invoked by the completion handler.
     virtual int PostRecvToSlot(UrmaJfrSlot&, uint32_t num);
@@ -169,6 +174,27 @@ public:
     std::atomic<uint32_t> jfr_rr_counter{0};
     std::shared_ptr<ImportedJfrCache> imports{new ImportedJfrCache};
 private:
+    struct WriteWaiter {
+        WriteWaiter(UrmaResourcePool* p, butil::atomic<int>* b)
+            : pool(p), butex(b) { pool->_active_writers.fetch_add(1); }
+        ~WriteWaiter();
+        UrmaResourcePool* const pool;
+        butil::atomic<int>* const butex;
+        WriteWaiter* prev{nullptr};
+        WriteWaiter* next{nullptr};
+        bool queued{false};
+        WriteWaiter(const WriteWaiter&) = delete;
+        WriteWaiter& operator=(const WriteWaiter&) = delete;
+    };
+    void RemoveWriterLocked(WriteWaiter* waiter);
+    void WakeWritersLocked();
+    // Never acquire a slot lock while holding this mutex. Waking a butex
+    // neither yields nor executes the awakened writer inline.
+    butil::Mutex _writers_mutex;
+    WriteWaiter* _writers{nullptr};
+    std::atomic<bool> _has_writers{false};
+    std::atomic<uint32_t> _active_writers{0};
+    bool _writers_closed{false};
     int CreateCompletionQueue(urma_context_t*, UrmaIoSlot*, uint32_t);
     EventAdapter _events;
 };

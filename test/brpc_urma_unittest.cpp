@@ -35,6 +35,7 @@
 #include "brpc/urma/urma_helper.h"
 #include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma_transport.h"
+#include "bthread/butex.h"
 #include "brpc/server.h"
 #include "brpc/input_messenger.h"
 #include "brpc/input_message_base.h"
@@ -1248,6 +1249,183 @@ TEST_F(UrmaPooledTest, ordered_receive_drains_gap_across_sequence_wrap) {
     receive(0, "duplicate");
     EXPECT_TRUE(socket->Failed());
     EXPECT_EQ("abc", ep->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, shared_sq_completion_wakes_other_connection) {
+    auto* waiting = Endpoint();
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, waiting);
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf data;
+    data.append("complete on a different connection");
+    butil::IOBuf* input[] = {&data};
+    ASSERT_GT(sender->CutFromIOBufList(input, 1), 0);
+    // Reserve the rest of the shared capacity, without any WR owned by waiting.
+    while (_pool->AcquireJfs()) {}
+    ASSERT_FALSE(_pool->IsWritable());
+    auto* socket = _sockets[0].get();
+    auto* transport = static_cast<UrmaTransport*>(socket->_transport.get());
+    transport->_urma_state = UrmaTransport::URMA_ON;
+    std::atomic<bool> entered{false};
+    int64_t elapsed = 0;
+    std::thread writer([&] {
+        const auto deadline = butil::milliseconds_from_now(500);
+        const int64_t start = butil::gettimeofday_us();
+        entered.store(true);
+        transport->WaitEpollOut(socket->_epollout_butex, true, deadline);
+        elapsed = butil::gettimeofday_us() - start;
+    });
+    while (!entered.load()) { std::this_thread::yield(); }
+    usleep(20000);
+    DrainTx();
+    writer.join();
+    EXPECT_LT(elapsed, 250000) << "Shared capacity must not wait for timeout";
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+    DrainRx();
+}
+
+TEST_F(UrmaPooledTest, shared_sq_wait_handles_preexisting_space_and_notification) {
+    auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
+    bx->store(0);
+    auto deadline = butil::milliseconds_from_now(100);
+    // Completion before registration: never sleep with space already available.
+    EXPECT_EQ(0, _pool->WaitWritable(bx, 0, &deadline));
+    EXPECT_FALSE(_pool->_has_writers.load());
+    while (_pool->AcquireJfs()) {}
+    // An earlier Socket notification must not be lost before entering wait.
+    bx->fetch_add(1);
+    EXPECT_EQ(-1, _pool->WaitWritable(bx, 0, &deadline));
+    EXPECT_EQ(EWOULDBLOCK, errno);
+    EXPECT_FALSE(_pool->_has_writers.load());
+    // Timed-out stack waiters must be removed before their butex is freed.
+    deadline = butil::milliseconds_from_now(2);
+    EXPECT_EQ(-1, _pool->WaitWritable(bx, 1, &deadline));
+    EXPECT_EQ(ETIMEDOUT, errno);
+    EXPECT_FALSE(_pool->_has_writers.load());
+    bthread::butex_destroy(bx);
+    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
+TEST_F(UrmaPooledTest, shared_sq_wait_registration_races_credit_release) {
+    auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
+    bx->store(0);
+    std::atomic<int> timeouts{0};
+    for (int i = 0; i < 200; ++i) {
+        while (_pool->AcquireJfs()) {}
+        const int expected = bx->load();
+        std::thread release([&] { _pool->ReleaseJfs(_pool->io_jfs[0]); });
+        const auto deadline = butil::milliseconds_from_now(100);
+        if (_pool->WaitWritable(bx, expected, &deadline) < 0 && errno == ETIMEDOUT) {
+            ++timeouts;
+        }
+        release.join();
+        EXPECT_FALSE(_pool->_has_writers.load());
+    }
+    EXPECT_EQ(0, timeouts.load());
+    bthread::butex_destroy(bx);
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
+TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
+    while (_pool->AcquireJfs()) {}
+    butil::atomic<int>* bx[3];
+    std::thread writers[3];
+    std::atomic<int> timeouts{0};
+    for (int i = 0; i < 3; ++i) {
+        bx[i] = bthread::butex_create_checked<butil::atomic<int>>();
+        bx[i]->store(0);
+        writers[i] = std::thread([&, i] {
+            const auto deadline = butil::milliseconds_from_now(1000);
+            if (_pool->WaitWritable(bx[i], 0, &deadline) < 0 && errno == ETIMEDOUT) {
+                ++timeouts;
+            }
+        });
+        // Order registration so the next cancellation removes the middle node.
+        const int64_t end = butil::gettimeofday_us() + 500000;
+        size_t queued = 0;
+        do {
+            {
+                BAIDU_SCOPED_LOCK(_pool->_writers_mutex);
+                queued = 0;
+                for (auto* node = _pool->_writers; node; node = node->next) { ++queued; }
+            }
+            if (queued == static_cast<size_t>(i + 1)) { break; }
+            std::this_thread::yield();
+        } while (butil::gettimeofday_us() < end);
+        EXPECT_EQ(static_cast<size_t>(i + 1), queued);
+    }
+    // Socket failure/cancellation uses this same butex and must unlink safely.
+    bx[1]->fetch_add(1);
+    bthread::butex_wake_all(bx[1]);
+    writers[1].join();
+    bthread::butex_destroy(bx[1]);
+    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    for (int i : {0, 2}) {
+        writers[i].join();
+        bthread::butex_destroy(bx[i]);
+    }
+    EXPECT_EQ(0, timeouts.load());
+    EXPECT_FALSE(_pool->_has_writers.load());
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
+TEST_F(UrmaPooledTest, shared_sq_shutdown_notifies_registered_waiters) {
+    while (_pool->AcquireJfs()) {}
+    auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
+    bx->store(0);
+    std::atomic<int> result{-2};
+    std::thread writer([&] {
+        const auto deadline = butil::milliseconds_from_now(1000);
+        const int rc = _pool->WaitWritable(bx, 0, &deadline);
+        result.store(rc == 0 || errno == EWOULDBLOCK ? 0 : errno);
+    });
+    while (!_pool->_has_writers.load()) { std::this_thread::yield(); }
+    EXPECT_TRUE(_pool->Shutdown());
+    writer.join();
+    EXPECT_EQ(0, result.load());
+    EXPECT_FALSE(_pool->_has_writers.load());
+    const auto deadline = butil::milliseconds_from_now(1);
+    EXPECT_EQ(-1, _pool->WaitWritable(bx, bx->load(), &deadline));
+    EXPECT_EQ(EIO, errno);
+    bthread::butex_destroy(bx);
+}
+
+TEST_F(UrmaPooledTest, shared_sq_shutdown_drains_returning_guards) {
+    auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
+    bx->store(0);
+    std::atomic<bool> entered{false}, release{false}, stopped{false};
+    std::thread writer([&] {
+        urma::UrmaResourcePool::WriteWaiter waiter(_pool.get(), bx);
+        entered.store(true);
+        while (!release.load()) { std::this_thread::yield(); }
+    });
+    while (!entered.load()) { std::this_thread::yield(); }
+    std::thread shutdown([&] {
+        EXPECT_TRUE(_pool->Shutdown());
+        stopped.store(true);
+    });
+    // Wait until shutdown has closed registration, while the returning guard
+    // deliberately remains alive and no longer belongs to the waiter list.
+    for (;;) {
+        bool closed;
+        {
+            BAIDU_SCOPED_LOCK(_pool->_writers_mutex);
+            closed = _pool->_writers_closed;
+        }
+        if (closed) { break; }
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(stopped.load());
+    release.store(true);
+    writer.join();
+    shutdown.join();
+    EXPECT_TRUE(stopped.load());
+    EXPECT_EQ(0u, _pool->_active_writers.load());
+    bthread::butex_destroy(bx);
 }
 
 TEST_F(UrmaPooledTest, concurrent_sq_reservations_do_not_exceed_depth) {

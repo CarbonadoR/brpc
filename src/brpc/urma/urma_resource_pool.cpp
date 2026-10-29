@@ -16,9 +16,11 @@
 // under the License.
 
 #include "brpc/urma/urma_resource_pool.h"
+#include "bthread/butex.h"
 
 #if BRPC_WITH_URMA
 #include <cerrno>
+#include <thread>
 #include <cstring>
 #include <gflags/gflags.h>
 #include "butil/fd_utility.h"
@@ -177,6 +179,71 @@ bool UrmaResourcePool::IsWritable() const {
     }
     return false;
 }
+UrmaResourcePool::WriteWaiter::~WriteWaiter() {
+    const int saved_errno = errno;
+    {
+        BAIDU_SCOPED_LOCK(pool->_writers_mutex);
+        pool->RemoveWriterLocked(this);
+    }
+    // Last access to the pool: Shutdown waits for returning guards as well
+    // as queued waiters before allowing the pool mutex to be destroyed.
+    pool->_active_writers.fetch_sub(1);
+    errno = saved_errno;
+}
+
+void UrmaResourcePool::RemoveWriterLocked(WriteWaiter* waiter) {
+    if (!waiter->queued) { return; }
+    if (waiter->prev) { waiter->prev->next = waiter->next; }
+    else { _writers = waiter->next; }
+    if (waiter->next) { waiter->next->prev = waiter->prev; }
+    waiter->queued = false;
+    _has_writers.store(_writers != nullptr);
+}
+
+void UrmaResourcePool::WakeWritersLocked() {
+    while (_writers) {
+        auto* waiter = _writers;
+        RemoveWriterLocked(waiter);
+        // Cancellation must acquire _writers_mutex before the stack node or
+        // its Socket butex can disappear. Do not retain either after unlocking.
+        waiter->butex->fetch_add(1, butil::memory_order_release);
+        bthread::butex_wake_except(waiter->butex, INVALID_BTHREAD);
+    }
+}
+
+int UrmaResourcePool::WaitWritable(butil::atomic<int>* butex, int expected,
+                                    const timespec* deadline) {
+    WriteWaiter waiter(this, butex);
+    {
+        BAIDU_SCOPED_LOCK(_writers_mutex);
+        if (_writers_closed) { errno = EIO; return -1; }
+        waiter.next = _writers;
+        if (_writers) { _writers->prev = &waiter; }
+        _writers = &waiter;
+        waiter.queued = true;
+        // Publish BEFORE checking space. Together with the sequentially
+        // consistent credit decrement/check in ReleaseJfs, this prevents both
+        // sides missing each other when completion races registration.
+        _has_writers.store(true);
+        if (IsWritable()) {
+            RemoveWriterLocked(&waiter);
+            return 0;
+        }
+    }
+    // The caller sampled expected before checking writability. A notification
+    // before this wait changes the butex value and produces EWOULDBLOCK.
+    // The stack guard unregisters before returning and preserves errno.
+    return bthread::butex_wait(butex, expected, deadline);
+}
+
+void UrmaResourcePool::ReleaseJfs(UrmaJfsSlot* slot) {
+    slot->sq_inflight.fetch_sub(1);
+    // No allocations, mutex acquisitions or connection scans without waiters.
+    if (!_has_writers.load()) { return; }
+    BAIDU_SCOPED_LOCK(_writers_mutex);
+    WakeWritersLocked();
+}
+
 int UrmaResourcePool::PostSend(UrmaJfsSlot* slot, urma_jfs_wr_t* wr,
                                TxCompletionCtx* context) {
     BAIDU_SCOPED_LOCK(slot->mutex);
@@ -246,6 +313,12 @@ int UrmaResourcePool::RepostRecv(UrmaJfrSlot& slot, RxRecvCtx* context) {
 }
 
 bool UrmaResourcePool::Shutdown() {
+    {
+        BAIDU_SCOPED_LOCK(_writers_mutex);
+        _writers_closed = true;
+        WakeWritersLocked();
+    }
+    while (_active_writers.load() != 0) { std::this_thread::yield(); }
     bool success = true;
     for (auto* slot : io_jfs) {
         BAIDU_SCOPED_LOCK(slot->mutex);

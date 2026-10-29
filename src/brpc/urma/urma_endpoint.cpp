@@ -451,7 +451,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         ctx->connection = _conn_res;
         ctx->seq = _next_send_seq;
         auto fail = [&](int error) -> ssize_t {
-            slot->sq_inflight.fetch_sub(1);
+            g_urma_pool->ReleaseJfs(slot);
             errno = error;
             return total ? total : -1;
         };
@@ -573,7 +573,7 @@ void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
     }
     const SocketId sid = ctx->self_socket_id;
     delete ctx;
-    slot->sq_inflight.fetch_sub(1);
+    g_urma_pool->ReleaseJfs(slot);
     SocketUniquePtr socket;
     if (Socket::Address(sid, &socket) == 0) {
         if (cr.status != URMA_CR_SUCCESS) {
