@@ -627,6 +627,7 @@ protected:
                      urma::TxCompletionCtx* ctx) override {
             const int rc = UrmaResourcePool::PostSend(slot, wr, ctx);
             if (rc == 0) {
+                send_jfs_indices.push_back(slot->index);
                 sends.emplace_back(wr->send.src.sge,
                                    wr->send.src.sge + wr->send.src.num_sge);
             }
@@ -642,6 +643,7 @@ protected:
         }
         bool fail_next_repost{false};
         std::vector<std::vector<urma_sge_t>> sends;
+        std::vector<uint32_t> send_jfs_indices;
     };
     void AppendBlock(butil::IOBuf* data, size_t len, char value) {
         // An explicit block size bypasses TLS so adjacent fragments cannot merge.
@@ -786,6 +788,9 @@ TEST_F(UrmaPooledTest, independent_queues_and_import_cache) {
 }
 
 TEST_F(UrmaPooledTest, pooled_send_reorder_and_wrap_preserve_stream) {
+    // Exercise cross-JFS reordering independently of the default affinity.
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_jfs_affinity", "false");
     auto* sender = Endpoint();
     auto* receiver = Endpoint();
     ASSERT_NE(nullptr, sender);
@@ -1249,6 +1254,103 @@ TEST_F(UrmaPooledTest, ordered_receive_drains_gap_across_sequence_wrap) {
     receive(0, "duplicate");
     EXPECT_TRUE(socket->Failed());
     EXPECT_EQ("abc", ep->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, jfs_affinity_keeps_connection_fragments_together) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_TRUE(sender && receiver);
+    Connect(sender, receiver);
+    const std::string payload(12096, 'a');
+    butil::IOBuf data;
+    data.append(payload);
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              sender->CutFromIOBufList(input, 1));
+    ASSERT_GE(_pool->send_jfs_indices.size(), 3u);
+    for (uint32_t index : _pool->send_jfs_indices) {
+        EXPECT_EQ(_pool->send_jfs_indices.front(), index);
+    }
+    DrainTx();
+    DrainRx();
+    EXPECT_EQ(payload, receiver->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, jfs_affinity_distributes_more_connections_than_queues) {
+    const size_t count = _pool->io_jfs.size() * 2 + 1;
+    for (size_t connection = 0; connection < count; ++connection) {
+        auto* sender = Endpoint();
+        auto* receiver = Endpoint();
+        ASSERT_TRUE(sender && receiver);
+        Connect(sender, receiver);
+        const std::string payload(5000, 'b');
+        butil::IOBuf data;
+        data.append(payload);
+        butil::IOBuf* input[] = {&data};
+        const size_t first = _pool->send_jfs_indices.size();
+        ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+                  sender->CutFromIOBufList(input, 1));
+        ASSERT_GT(_pool->send_jfs_indices.size(), first);
+        for (size_t i = first; i < _pool->send_jfs_indices.size(); ++i) {
+            EXPECT_EQ(connection % _pool->io_jfs.size(),
+                      _pool->send_jfs_indices[i]);
+        }
+        DrainTx();
+        DrainRx();
+        EXPECT_EQ(payload, receiver->_input_processor.read_buf().to_string());
+    }
+}
+
+TEST_F(UrmaPooledTest, jfs_affinity_falls_back_then_returns_to_preferred_queue) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_TRUE(sender && receiver);
+    Connect(sender, receiver);
+    ASSERT_EQ(2u, _pool->io_jfs.size());
+    auto* preferred = _pool->io_jfs[0];
+    auto send = [&] {
+        butil::IOBuf data;
+        data.append("x");
+        butil::IOBuf* input[] = {&data};
+        EXPECT_EQ(1, sender->CutFromIOBufList(input, 1));
+        DrainTx();
+        DrainRx();
+    };
+    preferred->sq_inflight.store(preferred->sq_depth);
+    send();
+    preferred->sq_inflight.store(0);
+    send();
+    preferred->stopped.store(true);
+    send();
+    preferred->stopped.store(false);
+    send();
+    EXPECT_EQ((std::vector<uint32_t>{1, 0, 1, 0}), _pool->send_jfs_indices);
+    EXPECT_EQ("xxxx", receiver->_input_processor.read_buf().to_string());
+    while (_pool->AcquireJfs()) {}
+    EXPECT_EQ(nullptr, _pool->AcquirePreferredJfs(0));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_FALSE(_pool->IsWritable());
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
+TEST_F(UrmaPooledTest, jfs_affinity_can_restore_per_wr_round_robin) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+                     "urma_jfs_affinity", "false").empty());
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_TRUE(sender && receiver);
+    Connect(sender, receiver);
+    butil::IOBuf data;
+    data.append(std::string(12096, 'c'));
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(12096, sender->CutFromIOBufList(input, 1));
+    ASSERT_GE(_pool->send_jfs_indices.size(), 3u);
+    for (size_t i = 0; i < _pool->send_jfs_indices.size(); ++i) {
+        EXPECT_EQ(i % _pool->io_jfs.size(), _pool->send_jfs_indices[i]);
+    }
+    DrainTx();
+    DrainRx();
 }
 
 TEST_F(UrmaPooledTest, shared_sq_completion_wakes_other_connection) {

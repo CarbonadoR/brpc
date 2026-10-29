@@ -443,7 +443,12 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     butil::StackVector<urma_sge_t, 16> sge;
     for (size_t i = 0; i < ndata; ) {
         if (from[i]->empty()) { ++i; continue; }
-        UrmaJfsSlot* slot = g_urma_pool->AcquireJfs();
+        if (FLAGS_urma_jfs_affinity && _preferred_jfs == UINT32_MAX) {
+            _preferred_jfs = g_urma_pool->jfs_rr_counter.fetch_add(1);
+        }
+        UrmaJfsSlot* slot = FLAGS_urma_jfs_affinity
+            ? g_urma_pool->AcquirePreferredJfs(_preferred_jfs)
+            : g_urma_pool->AcquireJfs();
         if (!slot) { return total ? total : -1; }
         std::unique_ptr<TxCompletionCtx> ctx(new TxCompletionCtx);
         ctx->self_socket_id = _self_socket_id;

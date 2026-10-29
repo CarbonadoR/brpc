@@ -38,6 +38,7 @@
 
 namespace brpc {
 namespace urma {
+DECLARE_bool(urma_jfs_affinity);
 DECLARE_int32(urma_io_jfs_cnt);
 DECLARE_int32(urma_io_jfr_cnt);
 DECLARE_int32(urma_io_sq_depth);
@@ -155,6 +156,7 @@ public:
     virtual int Initialize(urma_context_t*, const EventAdapter&);
     virtual bool Shutdown();
     virtual UrmaJfsSlot* AcquireJfs();
+    UrmaJfsSlot* AcquirePreferredJfs(uint32_t preferred);
     virtual uint32_t PickJfr();
     bool IsWritable() const;
     // Wait on the calling Socket's butex, but register for pool-wide SQ space.

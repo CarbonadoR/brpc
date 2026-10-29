@@ -29,6 +29,7 @@
 
 namespace brpc {
 namespace urma {
+DEFINE_bool(urma_jfs_affinity, true, "Prefer a stable shared JFS for each connection");
 DEFINE_int32(urma_io_jfs_cnt, 48, "Number of process-wide IO JFS slots");
 DEFINE_int32(urma_io_jfr_cnt, 64, "Number of process-wide shared IO JFR slots");
 DEFINE_int32(urma_io_sq_depth, 128, "Depth of each pooled IO send queue");
@@ -163,6 +164,20 @@ UrmaJfsSlot* UrmaResourcePool::AcquireJfs() {
             if (slot->sq_inflight.compare_exchange_weak(used, used + 1)) {
                 return slot;
             }
+        }
+    }
+    errno = EAGAIN;
+    return nullptr;
+}
+UrmaJfsSlot* UrmaResourcePool::AcquirePreferredJfs(uint32_t preferred) {
+    if (io_jfs.empty()) { errno = ENODEV; return nullptr; }
+    // Prefer affinity, but preserve pool-wide backpressure/wakeup semantics.
+    for (size_t i = 0; i < io_jfs.size(); ++i) {
+        auto* slot = io_jfs[(preferred + i) % io_jfs.size()];
+        if (slot->stopped.load()) { continue; }
+        uint32_t n = slot->sq_inflight.load(std::memory_order_relaxed);
+        while (n < slot->sq_depth) {
+            if (slot->sq_inflight.compare_exchange_weak(n, n + 1)) return slot;
         }
     }
     errno = EAGAIN;
