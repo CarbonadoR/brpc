@@ -139,6 +139,31 @@ UrmaDeferredMessage::~UrmaDeferredMessage() noexcept(false) {
 
 DEFINE_bool(urma_inline_last, true,
             "Process one URMA message inline after CQ event release (startup only)");
+DEFINE_bool(urma_rx_batch_parse, true,
+            "Parse each connection once per CQ poll result (startup only)");
+
+void UrmaRxParseBatch::Add(SocketUniquePtr& socket) {
+    for (size_t i = 0; i < size; ++i) {
+        if (sockets[i].get() == socket.get()) { return; }
+    }
+    CHECK_LT(size, 32u);
+    sockets[size++] = std::move(socket);
+}
+
+void UrmaEndpoint::FlushRxBatch(UrmaRxParseBatch* batch, UrmaDeferredMessage* deferred) {
+    for (size_t i = 0; i < batch->size; ++i) {
+        auto& socket = batch->sockets[i];
+        if (!socket->Failed() && socket->_transport &&
+            socket->socket_mode() == SOCKET_MODE_URMA) {
+            auto* transport = static_cast<UrmaTransport*>(socket->_transport.get());
+            if (transport->_urma_ep) {
+                transport->_urma_ep->DispatchReceivedBytes(socket, 0, deferred);
+            }
+        }
+        socket.reset();
+    }
+    batch->size = 0;
+}
 
 // Flags used here are declared in urma_endpoint.h (urma_use_polling,
 // urma_poller_num, urma_disable_bthread). Declare the rest here.
@@ -590,7 +615,8 @@ void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
 }
 
 void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
-                                      UrmaDeferredMessage* deferred) {
+                                      UrmaDeferredMessage* deferred,
+                                      UrmaRxParseBatch* batch) {
     auto* raw = reinterpret_cast<RxRecvCtx*>(cr.user_ctx);
     if (!raw || slot->pending.count(raw) != 1) {
         LOG(ERROR) << "Unknown URMA RX completion context";
@@ -636,12 +662,16 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
         if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }
         return;
     }
-    if (ep) { ep->ReorderAndDispatch(socket, seq, std::move(data), deferred); }
+    if (ep) {
+        ep->ReorderAndDispatch(socket, seq, std::move(data), deferred, batch != nullptr);
+        if (batch) { batch->Add(socket); }
+    }
 }
 
 void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
                                       butil::IOBuf data,
-                                      UrmaDeferredMessage* deferred) {
+                                      UrmaDeferredMessage* deferred,
+                                      bool defer_parse) {
     BAIDU_SCOPED_LOCK(_reorder_mutex);
     BAIDU_SCOPED_LOCK(_dispatch_mutex);
     const State state = _state.load(butil::memory_order_acquire);
@@ -677,7 +707,11 @@ void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
         _reorder_queue.erase(it);
         ++_deliver_base;
     }
-    DispatchReceivedBytesLocked(socket, bytes, deferred);
+    if (defer_parse) {
+        _pending_received_bytes.fetch_add(bytes);
+    } else {
+        DispatchReceivedBytesLocked(socket, bytes, deferred);
+    }
 }
 
 void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& socket, ssize_t bytes,
@@ -745,10 +779,21 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
                 std::max(1, std::min(32, FLAGS_urma_cqe_poll_once)), cr);
             if (count < 0) { return false; }
             if (!count) { return true; }
-            for (int i = 0; i < count; ++i) {
-                if (slot->type == UrmaIoSlot::JFS_SLOT) {
+            if (slot->type == UrmaIoSlot::JFS_SLOT) {
+                for (int i = 0; i < count; ++i) {
                     HandleTxCompletion(static_cast<UrmaJfsSlot*>(slot), cr[i]);
-                } else {
+                }
+            } else if (FLAGS_urma_rx_batch_parse) {
+                UrmaRxParseBatch batch;
+                for (int i = 0; i < count; ++i) {
+                    HandleRxCompletion(static_cast<UrmaJfrSlot*>(slot), cr[i],
+                                       delivery, &batch);
+                }
+                // Bound latency and storage to this poll result. Even a single
+                // CQE is flushed immediately; never wait for another arrival.
+                FlushRxBatch(&batch, delivery);
+            } else {
+                for (int i = 0; i < count; ++i) {
                     HandleRxCompletion(static_cast<UrmaJfrSlot*>(slot), cr[i], delivery);
                 }
             }

@@ -61,6 +61,14 @@ private:
 };
 
 DECLARE_bool(urma_inline_last);
+// One poll result, never a wait for additional completions. Socket references
+// keep endpoint storage alive until its accumulated bytes are dispatched.
+struct UrmaRxParseBatch {
+    SocketUniquePtr sockets[32];
+    size_t size{0};
+    void Add(SocketUniquePtr&);
+};
+
 DECLARE_bool(urma_use_polling);
 DECLARE_int32(urma_poller_num);
 DECLARE_bool(urma_disable_bthread);
@@ -139,7 +147,8 @@ public:
     static void DetachSlotSocket(UrmaIoSlot*);
     static void HandleTxCompletion(UrmaJfsSlot*, const urma_cr_t&);
     static void HandleRxCompletion(UrmaJfrSlot*, const urma_cr_t&,
-                                   UrmaDeferredMessage* = nullptr);
+                                   UrmaDeferredMessage* = nullptr,
+                                   UrmaRxParseBatch* = nullptr);
 
     // Compatibility entry points; polling mode currently returns ENOTSUP.
     static int PollingModeInitialize(bthread_tag_t tag,
@@ -208,8 +217,11 @@ private:
     // Returns 0 on success.
     int ImportPeer(const ParsedHello& peer);
 
+    static void FlushRxBatch(UrmaRxParseBatch*, UrmaDeferredMessage*);
+
     void ReorderAndDispatch(SocketUniquePtr&, uint16_t seq, butil::IOBuf data,
-                            UrmaDeferredMessage* = nullptr);
+                            UrmaDeferredMessage* = nullptr,
+                            bool defer_parse = false);
     void DispatchReceivedBytesLocked(SocketUniquePtr&, ssize_t bytes,
                                      UrmaDeferredMessage* = nullptr);
 

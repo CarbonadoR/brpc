@@ -2023,6 +2023,162 @@ TEST_F(UrmaPooledTest, inline_batch_releases_locks_and_event_once_for_all_connec
     DrainTx();
 }
 
+
+struct RxBatchParseProbe {
+    struct Message : InputMessageBase {
+        std::string bytes;
+        void DestroyImpl() override { delete this; }
+    };
+    std::atomic<int> attempts{0};
+    std::atomic<int> processed{0};
+    static ParseResult Parse(butil::IOBuf* data, Socket*, bool, const void* arg) {
+        auto* probe = const_cast<RxBatchParseProbe*>(
+            static_cast<const RxBatchParseProbe*>(arg));
+        if (!data->empty()) { ++probe->attempts; }
+        if (data->size() < 9) { return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA); }
+        auto* message = new Message;
+        data->cutn(&message->bytes, 9);
+        return MakeMessage(message);
+    }
+    static void Process(InputMessageBase* message) {
+        auto* probe = const_cast<RxBatchParseProbe*>(
+            static_cast<const RxBatchParseProbe*>(message->arg()));
+        EXPECT_EQ("abcdefghi", static_cast<Message*>(message)->bytes);
+        message->Destroy();
+        ++probe->processed;
+    }
+};
+
+TEST_F(UrmaPooledTest, rx_batch_parses_interleaved_connections_once_per_poll) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_rx_batch_parse", "true").empty());
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_cqe_poll_once", "32");
+    RxBatchParseProbe probe;
+    InputMessenger messenger;
+    InputMessageHandler handler = {RxBatchParseProbe::Parse,
+        RxBatchParseProbe::Process, nullptr, &probe, "rx-batch-probe"};
+    ASSERT_EQ(0, messenger.AddNonProtocolHandler(handler));
+    SocketOptions options;
+    options.user = _pool->io_jfr[0];
+    _pool->io_jfr[0]->AddRef();
+    SocketId sid;
+    ASSERT_EQ(0, Socket::Create(options, &sid));
+    SocketUniquePtr carrier;
+    ASSERT_EQ(0, Socket::Address(sid, &carrier));
+    urma::UrmaEndpoint* senders[2];
+    for (int i = 0; i < 2; ++i) {
+        senders[i] = Endpoint();
+        auto* receiver = Endpoint();
+        ASSERT_TRUE(senders[i] && receiver);
+        receiver->_socket->_user = &messenger;
+        receiver->_state = urma::UrmaEndpoint::ESTABLISHED;
+        Connect(senders[i], receiver);
+    }
+    // Deliberately interleave connections. A bounded batch must deduplicate
+    // them without mixing their streams or waiting for another CQ event.
+    for (const char* part : {"abc", "def", "ghi"}) {
+        for (auto* sender : senders) {
+            butil::IOBuf data;
+            data.append(part, 3);
+            butil::IOBuf* list[] = {&data};
+            ASSERT_EQ(3, sender->CutFromIOBufList(list, 1));
+        }
+    }
+    carrier->_nevent.store(1);
+    urma::UrmaEndpoint::PollIoJfc(carrier.get());
+    const int64_t deadline = butil::monotonic_time_us() + 2000000;
+    while (probe.processed != 2 && butil::monotonic_time_us() < deadline) {
+        usleep(1000);
+    }
+    EXPECT_EQ(2, probe.processed.load());
+    EXPECT_EQ(2, probe.attempts.load());
+    // With a one-CQE poll budget, incomplete messages must be parsed/flushed
+    // at every poll result, without waiting for the whole message to arrive.
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_cqe_poll_once", "1");
+    for (const char* part : {"abc", "def", "ghi"}) {
+        for (auto* sender : senders) {
+            butil::IOBuf data;
+            data.append(part, 3);
+            butil::IOBuf* list[] = {&data};
+            ASSERT_EQ(3, sender->CutFromIOBufList(list, 1));
+        }
+    }
+    carrier->_nevent.store(1);
+    urma::UrmaEndpoint::PollIoJfc(carrier.get());
+    const int64_t second_deadline = butil::monotonic_time_us() + 2000000;
+    while (probe.processed != 4 && butil::monotonic_time_us() < second_deadline) {
+        usleep(1000);
+    }
+    EXPECT_EQ(4, probe.processed.load());
+    EXPECT_EQ(8, probe.attempts.load());
+    for (auto& socket : _sockets) { socket->_user = nullptr; }
+    carrier->SetFailed();
+    DrainTx();
+}
+
+
+TEST_F(UrmaPooledTest, rx_batch_preserves_handshake_dispatch_boundary) {
+    RxBatchParseProbe probe;
+    InputMessenger messenger;
+    InputMessageHandler handler = {RxBatchParseProbe::Parse,
+        RxBatchParseProbe::Process, nullptr, &probe, "rx-handshake-probe"};
+    ASSERT_EQ(0, messenger.AddNonProtocolHandler(handler));
+    auto* ep = Endpoint();
+    ASSERT_TRUE(ep);
+    ep->_socket->_user = &messenger;
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(ep->_socket->id(), &socket));
+    urma::UrmaRxParseBatch batch;
+    butil::IOBuf data;
+    data.append("abcdefghi", 9);
+    ep->ReorderAndDispatch(socket, 0, std::move(data), nullptr, true);
+    batch.Add(socket);
+    // Flush before the TCP handshake ACK must retain, not dispatch, bytes.
+    urma::UrmaEndpoint::FlushRxBatch(&batch, nullptr);
+    EXPECT_EQ(0, probe.attempts.load());
+    EXPECT_EQ(9, ep->_pending_received_bytes.load());
+    ASSERT_EQ(0, Socket::Address(ep->_socket->id(), &socket));
+    batch.Add(socket);
+    ep->_state = urma::UrmaEndpoint::ESTABLISHED;
+    ep->DispatchReceivedBytes(batch.sockets[0], 0);
+    // A handshake dispatch preceding the poll flush must not dispatch twice.
+    urma::UrmaEndpoint::FlushRxBatch(&batch, nullptr);
+    const int64_t deadline = butil::monotonic_time_us() + 2000000;
+    while (probe.processed != 1 && butil::monotonic_time_us() < deadline) {
+        usleep(1000);
+    }
+    EXPECT_EQ(1, probe.attempts.load());
+    EXPECT_EQ(1, probe.processed.load());
+    EXPECT_EQ(0, ep->_pending_received_bytes.load());
+    ep->_socket->_user = nullptr;
+}
+
+TEST_F(UrmaPooledTest, rx_batch_drops_failed_connection_before_flush) {
+    RxBatchParseProbe probe;
+    InputMessenger messenger;
+    InputMessageHandler handler = {RxBatchParseProbe::Parse,
+        RxBatchParseProbe::Process, nullptr, &probe, "rx-failure-probe"};
+    ASSERT_EQ(0, messenger.AddNonProtocolHandler(handler));
+    auto* ep = Endpoint();
+    ASSERT_TRUE(ep);
+    ep->_socket->_user = &messenger;
+    ep->_state = urma::UrmaEndpoint::ESTABLISHED;
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(ep->_socket->id(), &socket));
+    urma::UrmaRxParseBatch batch;
+    butil::IOBuf data;
+    data.append("abcdefghi", 9);
+    ep->ReorderAndDispatch(socket, 0, std::move(data), nullptr, true);
+    batch.Add(socket);
+    ep->_socket->SetFailed();
+    urma::UrmaEndpoint::FlushRxBatch(&batch, nullptr);
+    EXPECT_EQ(0u, batch.size);
+    EXPECT_EQ(0, probe.attempts.load());
+    EXPECT_EQ(0, probe.processed.load());
+    ep->_socket->_user = nullptr;
+}
+
 #else  // BRPC_WITH_URMA
 
 // When URMA is not compiled in, the test file is a no-op so the build stays
