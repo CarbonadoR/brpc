@@ -662,8 +662,9 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
         if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }
         return;
     }
+    // IOBuf uses Movable rather than a C++ rvalue move constructor.
     if (ep) {
-        ep->ReorderAndDispatch(socket, seq, std::move(data), deferred, batch != nullptr);
+        ep->ReorderAndDispatch(socket, seq, data.movable(), deferred, batch != nullptr);
         if (batch) { batch->Add(socket); }
     }
 }
@@ -687,7 +688,7 @@ void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
         return;
     }
     if (distance != 0) {
-        if (!_reorder_queue.emplace(seq, std::move(data)).second) {
+        if (!_reorder_queue.emplace(seq, data.movable()).second) {
             socket->SetFailed(EPROTO, "Duplicate URMA sequence %u base=%u",
                               seq, _deliver_base);
         }
@@ -697,13 +698,13 @@ void UrmaEndpoint::ReorderAndDispatch(SocketUniquePtr& socket, uint16_t seq,
     // ordered path allocation-free; only gaps need a map node. The same locks
     // still serialize reset, handshake dispatch, and arrivals from other JFSs.
     ssize_t bytes = data.size();
-    _input_processor.read_buf().append(data);
+    _input_processor.read_buf().append(data.movable());
     ++_deliver_base;
     // Lookup the expected key, not map.begin(): numeric sort is wrong at wrap.
     for (auto it = _reorder_queue.find(_deliver_base);
          it != _reorder_queue.end(); it = _reorder_queue.find(_deliver_base)) {
         bytes += it->second.size();
-        _input_processor.read_buf().append(it->second);
+        _input_processor.read_buf().append(it->second.movable());
         _reorder_queue.erase(it);
         ++_deliver_base;
     }
