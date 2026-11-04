@@ -37,6 +37,7 @@ def main():
     parser.add_argument('--label', required=True)
     parser.add_argument('--source-head', required=True)
     parser.add_argument('--build-command', required=True)
+    parser.add_argument('--bazel', default='bazel', help='Actual Bazel executable used for the build')
     args = parser.parse_args()
     source = args.source.resolve()
     root = args.output.resolve() / args.label
@@ -105,6 +106,7 @@ ARM64/aarch64；运行环境需安装匹配的 UMDK/UDMA、numactl 和 ldd 列�
 ```
 
 8K/100K 对比时同时修改 req_size 与 rsp_size 为 8192/102400。
+Avg-Latency/P99使用默认最近10秒窗口，QPS/错误覆盖完整正式阶段。
 QD 为进程总并发；多链路使用 link_num，并设置 --use_connection_group=true，
 避免多个 Channel 共享同一底层连接；测试前确认建立的 URMA 链路数量。
 修改硬件资源配置时必须同时记录两端 urma_io_jfs_cnt、urma_io_jfr_cnt、
@@ -124,15 +126,24 @@ JFS 的本地 EID 沿用当前源码自动选择第一个可用条目，须以�
     lock = source / 'MODULE.bazel.lock'
     if lock.exists():
         shutil.copy2(lock, root / 'provenance/MODULE.bazel.lock')
-    for name in ('BUILD.bazel', 'MODULE.bazel', '.bazelrc',
+    for name in ('BUILD.bazel', 'MODULE.bazel', '.bazelrc', '.bazelversion',
                  'tools/jfs_validation/BUILD.bazel'):
         dest = root / 'provenance/build_inputs' / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / name, dest)
     (root / 'provenance/build_command.txt').write_text(args.build_command + '\n')
+    for name in ('run_pair.py', 'compare_bazel.py'):
+        helper = source / 'tools/jfs_validation' / name
+        if helper.exists():
+            (root / 'tools').mkdir(exist_ok=True)
+            shutil.copy2(helper, root / 'tools' / name)
+    for document in sorted((source / 'docs/cn/urma_validation').glob('jfs_step*.md')):
+        (root / 'validation').mkdir(exist_ok=True)
+        shutil.copy2(document, root / 'validation' / document.name)
     metadata = {
         'label': args.label,
-        'source_head_before_baseline_support': args.source_head,
+        'source_head': args.source_head,
+        'bazel_version': subprocess.check_output([args.bazel, '--version'], text=True).strip(),
         'arch': subprocess.check_output(['uname', '-m'], text=True).strip(),
         'build_command': args.build_command,
         'link_mode': 'repository default ub_test cc_binary targets; additional cc_shared_library',

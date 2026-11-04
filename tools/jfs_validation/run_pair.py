@@ -56,7 +56,9 @@ def main():
 
     def remote(host, code, timeout=120):
         result = subprocess.run(ssh(host, ['python3', '-c', code]),
-                                capture_output=True, text=True, timeout=timeout, check=True)
+                                capture_output=True, text=True, timeout=timeout)
+        if result.returncode:
+            raise RuntimeError('Remote command failed on '+host+': '+result.stderr)
         return json.loads(result.stdout)
 
     root = args.remote_root
@@ -118,14 +120,21 @@ def main():
             server_start = remote(args.server, start)
             pid = server_start['pid']
             try:
-                result = remote(args.client, 'import subprocess,json,time,resource\n'
+                client_log = root + '/' + name + '_client.log'
+                result = remote(args.client, 'import subprocess,json,time,resource,os,signal\n'
                                 'begin=time.monotonic()\n'
-                                'p=subprocess.run(' + repr(client_cmd) + ',stdout=subprocess.PIPE,'
-                                'stderr=subprocess.STDOUT,text=True,timeout=' + str(args.seconds + 90) + ')\n'
+                                'log_path=' + repr(client_log) + '\n'
+                                'with open(log_path,"w") as f:\n'
+                                ' p=subprocess.Popen(' + repr(client_cmd) + ',stdout=f,'
+                                'stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL,start_new_session=True)\n'
+                                ' try:\n  rc=p.wait(timeout=' + str(args.seconds + 90) + ')\n'
+                                ' except subprocess.TimeoutExpired:\n'
+                                '  os.killpg(p.pid,signal.SIGTERM); rc=124\n'
                                 'elapsed=time.monotonic()-begin\n'
                                 'usage=resource.getrusage(resource.RUSAGE_CHILDREN)\n'
-                                'cpu=100*(usage.ru_utime+usage.ru_stime)/elapsed\n'
-                                'print(json.dumps({"returncode":p.returncode,"log":p.stdout,"cpu_percent":cpu}))',
+                                'cpu=100*(usage.ru_utime+usage.ru_stime)/elapsed if rc != 124 else None\n'
+                                'with open(log_path) as f: log=f.read()\n'
+                                'print(json.dumps({"returncode":rc,"log":log,"cpu_percent":cpu,"pid":p.pid}))',
                                 timeout=args.seconds + 110)
             finally:
                 server_result = remote(args.server, 'import os,signal,time,json\nfrom pathlib import Path\n'
@@ -142,11 +151,11 @@ def main():
                                      'except FileNotFoundError: pass\n'
                                      'time.sleep(1)\n'
                                      'print(json.dumps({"cpu_percent":cpu,"log":Path(' + repr(server_log) + ').read_text()}))')
-            (args.output / (name + '_server.log')).write_text(server_result['log'])
+                (args.output / (name + '_server.log')).write_text(server_result['log'])
             (args.output / (name + '_client.log')).write_text(result['log'])
             line = next((x for x in result['log'].splitlines() if 'Avg-Latency:' in x), '')
             case = {'name': name, 'server_command': server_cmd, 'client_command': client_cmd,
-                    'returncode': result['returncode'], 'summary': line,
+                    'returncode': result['returncode'], 'client_pid': result['pid'], 'summary': line,
                     'client_cpu_percent': result['cpu_percent'],
                     'server_cpu_percent': server_result['cpu_percent']}
             summary.append(case)
