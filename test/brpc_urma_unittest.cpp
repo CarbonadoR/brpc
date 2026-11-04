@@ -630,6 +630,14 @@ protected:
                 send_jfs_indices.push_back(slot->index);
                 sends.emplace_back(wr->send.src.sge,
                                    wr->send.src.sge + wr->send.src.num_sge);
+                if (complete_before_return) {
+                    urma_cr_t cr{};
+                    EXPECT_EQ(1, urma_poll_jfc(slot->jfc, 1, &cr));
+                    urma::UrmaEndpoint::HandleTxCompletion(slot, cr);
+                    // The endpoint's submit reference must still protect ctx.
+                    EXPECT_EQ(1u, ctx->refs.load());
+                    completed_data = ctx->send_data.to_string();
+                }
             }
             return rc;
         }
@@ -642,6 +650,8 @@ protected:
             return UrmaResourcePool::RepostRecv(slot, ctx);
         }
         bool fail_next_repost{false};
+        bool complete_before_return{false};
+        std::string completed_data;
         std::vector<std::vector<urma_sge_t>> sends;
         std::vector<uint32_t> send_jfs_indices;
     };
@@ -760,6 +770,61 @@ TEST_F(UrmaPooledTest, registered_header_pool_exhaustion_and_concurrency) {
     EXPECT_EQ(nullptr, memory->Allocate(65));
     EXPECT_TRUE(memory->Unregister());
     EXPECT_EQ(nullptr, memory->Allocate(64));
+}
+
+TEST_F(UrmaPooledTest, tx_descriptors_survive_submission_scope) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    butil::IOBuf input;
+    input.append(std::string(1024, 's'));
+    butil::IOBuf* buffers[] = {&input};
+    ASSERT_EQ(1024, sender->CutFromIOBufList(buffers, 1));
+    size_t pending = 0;
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(slot->sq_inflight.load(), slot->sq_device_inflight.load());
+        for (auto* ctx : slot->pending) {
+            ++pending;
+            EXPECT_EQ(ctx->sge->data(), ctx->wr.send.src.sge);
+            EXPECT_EQ(ctx->sge->size(), ctx->wr.send.src.num_sge);
+            EXPECT_EQ(reinterpret_cast<uint64_t>(ctx), ctx->wr.user_ctx);
+            EXPECT_EQ(1u, ctx->refs.load());
+        }
+    }
+    EXPECT_EQ(1u, pending);
+    DrainTx();
+    DrainRx();
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(0u, slot->sq_device_inflight.load());
+        EXPECT_EQ(0u, slot->sq_inflight.load());
+    }
+}
+
+TEST_F(UrmaPooledTest, tx_completion_before_submit_wrapper_returns_retains_data) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_NE(nullptr, sender);
+    ASSERT_NE(nullptr, receiver);
+    Connect(sender, receiver);
+    _pool->complete_before_return = true;
+    butil::IOBuf input;
+    input.append(std::string(1024, 'e'));
+    butil::IOBuf* buffers[] = {&input};
+    ASSERT_EQ(1024, sender->CutFromIOBufList(buffers, 1));
+    EXPECT_TRUE(input.empty());
+#if !BRPC_URMA_SINGLE_SGE
+    EXPECT_EQ(std::string(1024, 'e'), _pool->completed_data);
+#else
+    EXPECT_EQ(sizeof(urma::UrmaMsgHeader) + 1024, _pool->completed_data.size());
+#endif
+    DrainRx();
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_TRUE(slot->pending.empty());
+        EXPECT_EQ(0u, slot->sq_device_inflight.load());
+        EXPECT_EQ(0u, slot->sq_inflight.load());
+    }
 }
 
 TEST_F(UrmaPooledTest, independent_queues_and_import_cache) {

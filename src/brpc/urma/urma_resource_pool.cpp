@@ -264,10 +264,14 @@ int UrmaResourcePool::PostSend(UrmaJfsSlot* slot, urma_jfs_wr_t* wr,
     BAIDU_SCOPED_LOCK(slot->mutex);
     if (slot->stopped.load()) { errno = EIO; return -1; }
     slot->pending.insert(context);
+    context->AddRef();
+    slot->sq_device_inflight.fetch_add(1, std::memory_order_acq_rel);
     urma_jfs_wr_t* bad = nullptr;
     const urma_status_t rc = urma_post_jfs_wr(slot->jfs, wr, &bad);
     if (rc != URMA_SUCCESS) {
         slot->pending.erase(context);
+        slot->sq_device_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        context->Release();
         errno = rc > 0 ? rc : EIO;
         return -1;
     }
@@ -346,9 +350,10 @@ bool UrmaResourcePool::Shutdown() {
             continue;
         }
         slot->jfs = nullptr;
-        for (auto* ctx : slot->pending) { delete ctx; }
+        for (auto* ctx : slot->pending) { ctx->Release(); }
         slot->pending.clear();
         slot->sq_inflight.store(0);
+        slot->sq_device_inflight.store(0);
     }
     for (auto* slot : io_jfr) {
         BAIDU_SCOPED_LOCK(slot->mutex);

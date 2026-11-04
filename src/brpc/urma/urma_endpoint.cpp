@@ -465,7 +465,6 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         return -1;
     }
     ssize_t total = 0;
-    butil::StackVector<urma_sge_t, 16> sge;
     for (size_t i = 0; i < ndata; ) {
         if (from[i]->empty()) { ++i; continue; }
         if (FLAGS_urma_jfs_affinity && _preferred_jfs == UINT32_MAX) {
@@ -476,6 +475,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             : g_urma_pool->AcquireJfs();
         if (!slot) { return total ? total : -1; }
         std::unique_ptr<TxCompletionCtx> ctx(new TxCompletionCtx);
+        auto& sge = ctx->sge;
         ctx->self_socket_id = _self_socket_id;
         ctx->jfs_index = slot->index;
         ctx->connection = _conn_res;
@@ -567,18 +567,18 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         for (const auto& part : sge.container()) {
             if (!part.tseg) { return fail(ERDMAMEM); }
         }
-        urma_jfs_wr_t wr{};
+        urma_jfs_wr_t& wr = ctx->wr;
         wr.opcode = URMA_OPC_SEND;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _conn_res->remote_jfr;
         wr.send.src = urma_sg_t{sge->data(), static_cast<uint32_t>(sge->size())};
         wr.user_ctx = reinterpret_cast<uint64_t>(ctx.get());
-        // PostSend serializes publication with CQ draining. After it returns,
-        // the CQE may already have destroyed ctx: release without dereferencing.
+        // The submission reference keeps WR/SGEs/data alive even if completion
+        // is handled before this call returns. PostSend arms the CQE reference.
         if (g_urma_pool->PostSend(slot, &wr, ctx.get()) != 0) {
             return fail(errno);
         }
-        ctx.release();
+        ctx.release()->Release();
         size_t remaining = len;
         while (remaining != 0) {
             remaining -= from[i]->pop_front(remaining);
@@ -602,7 +602,8 @@ void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
         return;
     }
     const SocketId sid = ctx->self_socket_id;
-    delete ctx;
+    slot->sq_device_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    ctx->Release();
     g_urma_pool->ReleaseJfs(slot);
     SocketUniquePtr socket;
     if (Socket::Address(sid, &socket) == 0) {

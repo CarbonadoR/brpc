@@ -30,6 +30,7 @@
 #include "brpc/socket.h"
 #include "brpc/urma/urma_memory_pool.h"
 #include "butil/synchronization/lock.h"
+#include "butil/containers/stack_container.h"
 #include "urma_api.h"
 
 #ifndef BRPC_URMA_SINGLE_SGE
@@ -83,6 +84,15 @@ struct UrmaConnResource {
 };
 
 struct TxCompletionCtx {
+    // The submitting path retains one reference through post result handling.
+    // A second reference, armed before post, belongs to the expected CQE.
+    void AddRef() { refs.fetch_add(1, std::memory_order_relaxed); }
+    void Release() {
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete this; }
+    }
+    std::atomic<uint32_t> refs{1};
+    urma_jfs_wr_t wr{};
+    butil::StackVector<urma_sge_t, 16> sge;
     SocketId self_socket_id{INVALID_SOCKET_ID};
     uint32_t jfs_index{0};
     UrmaMsgHeader* header_buf{nullptr};
@@ -132,6 +142,7 @@ struct UrmaJfsSlot : public UrmaIoSlot {
     explicit UrmaJfsSlot(uint32_t i) : UrmaIoSlot(JFS_SLOT, i) {}
     urma_jfs_t* jfs{nullptr};
     std::atomic<uint32_t> sq_inflight{0};
+    std::atomic<uint32_t> sq_device_inflight{0};
     uint32_t sq_depth{0};
     std::set<TxCompletionCtx*> pending;
 };
