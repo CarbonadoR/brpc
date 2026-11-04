@@ -20,6 +20,7 @@
 
 #if BRPC_WITH_URMA
 #include <atomic>
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -76,6 +77,7 @@ private:
 };
 
 struct UrmaConnResource {
+    std::atomic<bool> failed{false};
     uint32_t local_jfr_index{0};
     urma_target_jetty_t* remote_jfr{nullptr};
     urma_target_seg_t* remote_seg{nullptr};
@@ -83,6 +85,7 @@ struct UrmaConnResource {
     ~UrmaConnResource();
 };
 
+struct TxBatch;
 struct TxCompletionCtx {
     // The submitting path retains one reference through post result handling.
     // A second reference, armed before post, belongs to the expected CQE.
@@ -103,11 +106,65 @@ struct TxCompletionCtx {
     uint16_t seq{0};
     uint8_t type{MSG_SMALL};
     bool header_in_send_data{false};
-    ~TxCompletionCtx() {
-        // In single-SGE builds header_buf points into send_data, which owns
-        // the complete registered wire buffer until this completion.
-        if (!header_in_send_data) { FreeHeaderBuffer(header_buf); }
+    size_t body_bytes{0};
+    uint32_t registry_index{0};
+    TxBatch* batch{nullptr};
+    ~TxCompletionCtx();
+};
+
+constexpr size_t URMA_TX_BATCH_MAX = 32;
+struct TxBatch {
+    static TxBatch* Unlinked() { return reinterpret_cast<TxBatch*>(uintptr_t(-1)); }
+    void AddRef() { refs.fetch_add(1, std::memory_order_relaxed); }
+    void Release() {
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete this; }
     }
+    void Append(TxCompletionCtx* ctx) {
+        ctx->batch = this;
+        AddRef();
+        items[count++] = ctx;
+    }
+    // Only for nodes not published to a JFS; no admitted credits to return.
+    void DiscardPrepared() {
+        for (size_t i = begin; i < count; ++i) {
+            if (items[i]) { items[i]->Release(); items[i] = nullptr; }
+        }
+        Release();
+    }
+    std::atomic<TxBatch*> next{Unlinked()};
+    std::atomic<uint32_t> refs{1};
+    std::array<TxCompletionCtx*, URMA_TX_BATCH_MAX> items{};
+    size_t begin{0};
+    size_t count{0};
+};
+
+// Combined close bit and operation count prevent entry racing shutdown.
+class UrmaOperationGate {
+public:
+    bool Enter() {
+        uint64_t old = state.load(std::memory_order_acquire);
+        while (!(old & kClosed)) {
+            if (state.compare_exchange_weak(old, old + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) { return true; }
+        }
+        return false;
+    }
+    void Leave() { state.fetch_sub(1, std::memory_order_release); }
+    void Close() { state.fetch_or(kClosed, std::memory_order_acq_rel); }
+    bool Idle() const { return (state.load(std::memory_order_acquire) & ~kClosed) == 0; }
+private:
+    static constexpr uint64_t kClosed = uint64_t(1) << 63;
+    std::atomic<uint64_t> state{0};
+};
+class UrmaOperation {
+public:
+    explicit UrmaOperation(UrmaOperationGate* gate) : _gate(gate->Enter() ? gate : nullptr) {}
+    ~UrmaOperation() { if (_gate) { _gate->Leave(); } }
+    explicit operator bool() const { return _gate != nullptr; }
+    UrmaOperation(const UrmaOperation&) = delete;
+    UrmaOperation& operator=(const UrmaOperation&) = delete;
+private:
+    UrmaOperationGate* _gate;
 };
 struct RxRecvCtx {
     UrmaMsgHeader* header_buf{nullptr};
@@ -134,6 +191,7 @@ struct UrmaIoSlot : public SocketUser {
     SocketId jfc_sid{INVALID_SOCKET_ID};
     // Serializes poll/post against teardown, not across different slots.
     butil::Mutex mutex;
+    UrmaOperationGate operations;
     std::atomic<bool> stopped{false};
 private:
     std::atomic<uint32_t> refs{1};
@@ -144,7 +202,22 @@ struct UrmaJfsSlot : public UrmaIoSlot {
     std::atomic<uint32_t> sq_inflight{0};
     std::atomic<uint32_t> sq_device_inflight{0};
     uint32_t sq_depth{0};
-    std::set<TxCompletionCtx*> pending;
+    enum { RUNNING = 1, KICK = 2 };
+    std::atomic<TxBatch*> incoming_head{nullptr};
+    TxBatch* pending_head{nullptr};
+    TxBatch* pending_tail{nullptr};
+    std::atomic<unsigned> drain_state{0};
+    std::unique_ptr<std::atomic<TxCompletionCtx*>[]> submitted;
+    uint32_t next_registry{0};
+    // Inspection at quiescent points (tests/debug), never used by CQ routing.
+    std::vector<TxCompletionCtx*> SubmittedContexts() const {
+        std::vector<TxCompletionCtx*> result;
+        for (uint32_t i = 0; submitted && i < sq_depth; ++i) {
+            auto* ctx = submitted[i].load(std::memory_order_acquire);
+            if (ctx) { result.push_back(ctx); }
+        }
+        return result;
+    }
 };
 struct UrmaJfrSlot : public UrmaIoSlot {
     explicit UrmaJfrSlot(uint32_t i) : UrmaIoSlot(JFR_SLOT, i) {}
@@ -175,7 +248,13 @@ public:
                      const timespec* deadline);
     // Every returned reservation, including post failures, may unblock peers.
     void ReleaseJfs(UrmaJfsSlot* slot);
-    virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*);
+    virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*,
+                         urma_jfs_wr_t** bad = nullptr);
+    UrmaJfsSlot* SelectJfs(uint32_t preferred, bool affinity) const;
+    int Enqueue(UrmaJfsSlot*, TxBatch*);
+    void KickDrain(UrmaJfsSlot*);
+    void CompleteSend(UrmaJfsSlot*, const urma_cr_t&);
+    UrmaOperationGate operations;
     // Caller holds slot.mutex when invoked by the completion handler.
     virtual int PostRecvToSlot(UrmaJfrSlot&, uint32_t num);
     // Reuse a completed receive context under slot.mutex. On failure it remains
@@ -187,6 +266,9 @@ public:
     std::atomic<uint32_t> jfr_rr_counter{0};
     std::shared_ptr<ImportedJfrCache> imports{new ImportedJfrCache};
 private:
+    void CollectIncoming(UrmaJfsSlot*);
+    void DrainSendQueue(UrmaJfsSlot*);
+    void CancelQueued(UrmaJfsSlot*);
     struct WriteWaiter {
         WriteWaiter(UrmaResourcePool* p, butil::atomic<int>* b)
             : pool(p), butex(b) { pool->_active_writers.fetch_add(1); }

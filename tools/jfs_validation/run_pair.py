@@ -40,6 +40,11 @@ def main():
     p.add_argument('--cpus', default='288-303')
     p.add_argument('--numa', default='3')
     p.add_argument('--device', default='udmac1d1e2')
+    p.add_argument('--jfs-count', type=int)
+    p.add_argument('--jfr-count', type=int)
+    p.add_argument('--sq-depth', type=int)
+    p.add_argument('--rx-depth', type=int)
+    p.add_argument('--log-chains', action='store_true')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
 
@@ -70,6 +75,14 @@ def main():
 
     common = ['--use_urma=true', '--urma_sge_mode=multi', '--urma_use_polling=false',
               '--urma_device=' + args.device]
+    for key, value in [('urma_io_jfs_cnt', args.jfs_count),
+                       ('urma_io_jfr_cnt', args.jfr_count),
+                       ('urma_io_sq_depth', args.sq_depth),
+                       ('urma_io_rx_depth', args.rx_depth)]:
+        if value is not None:
+            common.append('--{}={}'.format(key, value))
+    if args.log_chains:
+        common.append('--vmodule=urma_resource_pool=1')
     binding = ['numactl', '-C', args.cpus, '-m', args.numa]
     summary = []
     for size in args.sizes:
