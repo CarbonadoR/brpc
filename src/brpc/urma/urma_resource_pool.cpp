@@ -22,7 +22,6 @@
 #include <cerrno>
 #include <algorithm>
 #include <thread>
-#include <mutex>
 #include <cstring>
 #include <gflags/gflags.h>
 #include "butil/fd_utility.h"
@@ -513,18 +512,15 @@ void UrmaResourcePool::CompleteSend(UrmaJfsSlot* slot, const urma_cr_t& cr) {
 }
 
 int UrmaResourcePool::PostRecvToSlot(UrmaJfrSlot& slot, uint32_t num) {
+    if (slot.contexts || num != slot.rx_depth) { errno = EINVAL; return -1; }
+    slot.contexts.reset(new RxRecvCtx[num]);
     for (uint32_t i = 0; i < num; ++i) {
-        std::unique_ptr<RxRecvCtx> context(new RxRecvCtx);
+        auto* context = &slot.contexts[i];
         context->jfr_index = slot.index;
         context->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
         if (!context->header_buf) { errno = ENOMEM; return -1; }
         std::memset(context->header_buf, 0, sizeof(UrmaMsgHeader));
-        slot.pending.insert(context.get());
-        if (RepostRecv(slot, context.get()) != 0) {
-            slot.pending.erase(context.get());
-            return -1;
-        }
-        context.release();
+        if (RepostRecv(slot, context) != 0) { return -1; }
     }
     return 0;
 }
@@ -563,6 +559,8 @@ int UrmaResourcePool::RepostRecv(UrmaJfrSlot& slot, RxRecvCtx* context) {
         errno = EIO;
         return -1;
     }
+    context->posted = true;
+    ++slot.rx_posted;
     return 0;
 }
 
@@ -608,21 +606,18 @@ bool UrmaResourcePool::Shutdown() {
         slot->sq_device_inflight.store(0);
     }
     for (auto* slot : io_jfr) {
-        BAIDU_SCOPED_LOCK(slot->mutex);
         if (slot->jfr && urma_delete_jfr(slot->jfr) != URMA_SUCCESS) {
             success = false;
             continue;
         }
         slot->jfr = nullptr;
-        for (auto* ctx : slot->pending) { delete ctx; }
-        slot->pending.clear();
+        slot->contexts.reset();
+        slot->rx_posted = 0;
     }
     if (!success) { return false; }
     std::vector<UrmaIoSlot*> slots(io_jfs.begin(), io_jfs.end());
     slots.insert(slots.end(), io_jfr.begin(), io_jfr.end());
     for (auto* slot : slots) {
-        std::unique_lock<butil::Mutex> rx_lock(slot->mutex, std::defer_lock);
-        if (slot->type == UrmaIoSlot::JFR_SLOT) { rx_lock.lock(); }
         // Consume and acknowledge pending events before deleting the JFC.
         if (slot->jfce && slot->jfc) {
             urma_jfc_t* event = nullptr;

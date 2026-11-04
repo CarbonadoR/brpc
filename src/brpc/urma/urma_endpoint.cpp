@@ -25,7 +25,6 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -595,12 +594,14 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
                                       UrmaDeferredMessage* deferred,
                                       UrmaRxParseBatch* batch) {
     auto* raw = reinterpret_cast<RxRecvCtx*>(cr.user_ctx);
-    if (!raw || slot->pending.count(raw) != 1) {
+    if (!slot->Owns(raw) || !raw->posted) {
         LOG(ERROR) << "Unknown URMA RX completion context";
         slot->stopped.store(true);
         return;
     }
     RxRecvCtx* ctx = raw;
+    ctx->posted = false;
+    --slot->rx_posted;
     SocketUniquePtr socket;
     UrmaEndpoint* ep = nullptr;
     uint16_t seq = 0;
@@ -634,10 +635,18 @@ void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,
     // Context/header ownership stays with the shared slot until shutdown.
     // Copy receives can reuse the data block; zero-copy receives replace it.
     if (g_urma_pool->RepostRecv(*slot, ctx) != 0) {
-        slot->stopped.store(true);
-        LOG(ERROR) << "Failed to replenish shared URMA JFR " << slot->index;
-        if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }
-        return;
+        const int error = errno;
+        LOG(ERROR) << "Failed to replenish shared URMA JFR " << slot->index
+                   << " posted=" << slot->rx_posted << "/" << slot->rx_depth
+                   << " errno=" << error;
+        if (error != ENOMEM) {
+            slot->stopped.store(true);
+            if (socket) { socket->SetFailed(EIO, "URMA receive replenishment failed"); }
+            return;
+        }
+        // Allocation failure must not discard already received bytes or stop
+        // other array entries. The missing credit is visible in rx_posted.
+
     }
     // IOBuf uses Movable rather than a C++ rvalue move constructor.
     if (ep) {
@@ -750,8 +759,6 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
     auto* slot = static_cast<UrmaIoSlot*>(carrier->user());
     UrmaOperation active(&slot->operations);
     if (!active) { return; }
-    std::unique_lock<butil::Mutex> rx_lock(slot->mutex, std::defer_lock);
-    if (slot->type == UrmaIoSlot::JFR_SLOT) { rx_lock.lock(); }
     if (slot->stopped.load()) { return; }
     auto drain = [&]() -> bool {
         while (!slot->stopped.load()) {

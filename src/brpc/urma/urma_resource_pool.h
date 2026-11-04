@@ -24,7 +24,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -171,6 +170,7 @@ struct RxRecvCtx {
     void* data_block{nullptr};
     butil::IOBuf data_iobuf;
     uint32_t jfr_index{0};
+    bool posted{false}; // Single CQ consumer owns all RX state after startup.
     ~RxRecvCtx() { FreeHeaderBuffer(header_buf); }
 };
 
@@ -189,8 +189,6 @@ struct UrmaIoSlot : public SocketUser {
     urma_jfc_t* jfc{nullptr};
     urma_jfce_t* jfce{nullptr};
     SocketId jfc_sid{INVALID_SOCKET_ID};
-    // Serializes poll/post against teardown, not across different slots.
-    butil::Mutex mutex;
     UrmaOperationGate operations;
     std::atomic<bool> stopped{false};
 private:
@@ -243,7 +241,15 @@ struct UrmaJfrSlot : public UrmaIoSlot {
     uint32_t rx_depth{0};
     uint32_t jfr_id{0};
     urma_token_t token_value{};
-    std::set<RxRecvCtx*> pending;
+    std::unique_ptr<RxRecvCtx[]> contexts;
+    uint32_t rx_posted{0};
+    bool Owns(const RxRecvCtx* ctx) const {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ctx);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(contexts.get());
+        return contexts && address >= base &&
+            address - base < sizeof(RxRecvCtx) * rx_depth &&
+            (address - base) % sizeof(RxRecvCtx) == 0;
+    }
 };
 
 // Resource ownership and selection are independent of endpoint parsing. The
@@ -276,10 +282,10 @@ public:
     void KickDrain(UrmaJfsSlot*);
     void CompleteSend(UrmaJfsSlot*, const urma_cr_t&);
     UrmaOperationGate operations;
-    // Caller holds slot.mutex when invoked by the completion handler.
+    // Startup only; subsequent RX state is owned by the single CQ consumer.
     virtual int PostRecvToSlot(UrmaJfrSlot&, uint32_t num);
-    // Reuse a completed receive context under slot.mutex. On failure it remains
-    // owned by slot.pending, so shutdown still controls the DMA lifetime.
+    // Reuse a completed array entry. A failed repost remains owned by the
+    // fixed array; successful JFR deletion is its DMA quiescence boundary.
     virtual int RepostRecv(UrmaJfrSlot&, RxRecvCtx*);
     std::vector<UrmaJfsSlot*> io_jfs;
     std::vector<UrmaJfrSlot*> io_jfr;
