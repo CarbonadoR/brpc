@@ -128,6 +128,7 @@ public:
 
     // Whether the endpoint can post more sends (the shared pool has SQ capacity).
     bool IsWritable() const;
+    uint32_t PreferredJfs() const;
 
     // For debug: dump endpoint state to @os.
     void DebugInfo(std::ostream& os,

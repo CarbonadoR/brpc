@@ -468,121 +468,127 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     if (!operation || _conn_res->failed.load(std::memory_order_acquire)) {
         errno = EIO; return -1;
     }
-    if (_preferred_jfs == UINT32_MAX) {
-        _preferred_jfs = g_urma_pool->jfs_rr_counter.fetch_add(1);
-    }
+    if (_preferred_jfs == UINT32_MAX) { _preferred_jfs = PreferredJfs(); }
     const uint32_t start = FLAGS_urma_jfs_affinity ? _preferred_jfs
         : g_urma_pool->jfs_rr_counter.fetch_add(1);
-    auto* slot = g_urma_pool->SelectJfs(start, FLAGS_urma_jfs_affinity);
-    if (!slot) { return -1; }
-    const uint32_t used = slot->sq_inflight.load(std::memory_order_relaxed);
-    if (used >= slot->sq_depth) { errno = EAGAIN; return -1; }
-    const size_t budget = std::min<size_t>(URMA_TX_BATCH_MAX, slot->sq_depth - used);
     butil::IOBuf remaining;
     for (size_t j = 0; j < ndata; ++j) { remaining.append(*from[j]); }
     if (remaining.empty()) { return 0; }
-    auto discard = [](TxBatch* node) { if (node) { node->DiscardPrepared(); } };
-    std::unique_ptr<TxBatch, decltype(discard)> batch(new TxBatch, discard);
-    size_t bytes = 0;
-    int prepare_error = 0;
-    while (!remaining.empty() && batch->count < budget) {
-        std::unique_ptr<TxCompletionCtx> ctx(new TxCompletionCtx);
-        ctx->self_socket_id = _self_socket_id;
-        ctx->jfs_index = slot->index;
-        ctx->connection = _conn_res;
-        ctx->seq = static_cast<uint16_t>(_next_send_seq + batch->count);
-        auto& sge = ctx->sge;
-        size_t limit = std::min<size_t>(_remote_recv_block_size, GetUrmaRecvBlockSize());
-        limit = std::min(limit, URMA_CTP_MAX_MESSAGE_SIZE - sizeof(UrmaMsgHeader));
-        size_t len = 0;
+    size_t total_bytes = 0;
+    for (int route = 0; route < 2; ++route) {
+        auto* slot = route == 0 ? g_urma_pool->io_jfs[start % g_urma_pool->io_jfs.size()]
+                               : g_urma_pool->PickBackup(start);
+        if (!slot) { break; }
+        const uint32_t used = slot->sq_inflight.load(std::memory_order_relaxed);
+        if (slot->stopped.load() || used >= slot->sq_depth) { errno = EAGAIN; continue; }
+        const size_t budget = std::min<size_t>(URMA_TX_BATCH_MAX, slot->sq_depth - used);
+        auto discard = [](TxBatch* node) { if (node) { node->DiscardPrepared(); } };
+        std::unique_ptr<TxBatch, decltype(discard)> batch(new TxBatch, discard);
+        size_t bytes = 0;
+        int prepare_error = 0;
+        while (!remaining.empty() && batch->count < budget) {
+            std::unique_ptr<TxCompletionCtx> ctx(new TxCompletionCtx);
+            ctx->self_socket_id = _self_socket_id;
+            ctx->jfs_index = slot->index;
+            ctx->connection = _conn_res;
+            ctx->seq = static_cast<uint16_t>(_next_send_seq + batch->count);
+            auto& sge = ctx->sge;
+            size_t limit = std::min<size_t>(_remote_recv_block_size, GetUrmaRecvBlockSize());
+            limit = std::min(limit, URMA_CTP_MAX_MESSAGE_SIZE - sizeof(UrmaMsgHeader));
+            size_t len = 0;
 #if BRPC_URMA_SINGLE_SGE
-        if (GetUrmaRecvBlockSize() <= sizeof(UrmaMsgHeader)) { prepare_error = EMSGSIZE; break; }
-        limit = std::min(limit, GetUrmaRecvBlockSize() - sizeof(UrmaMsgHeader));
-        void* wire = nullptr;
-        {
-            butil::IOBufAsZeroCopyOutputStream stream(
-                &ctx->send_data, GetUrmaRecvBlockSize() + IOBUF_BLOCK_HEADER_LEN);
-            int capacity = 0;
-            if (!stream.Next(&wire, &capacity) ||
-                capacity < static_cast<int>(sizeof(UrmaMsgHeader) + limit)) {
-                prepare_error = ENOMEM; break;
+            if (GetUrmaRecvBlockSize() <= sizeof(UrmaMsgHeader)) { prepare_error = EMSGSIZE; break; }
+            limit = std::min(limit, GetUrmaRecvBlockSize() - sizeof(UrmaMsgHeader));
+            void* wire = nullptr;
+            {
+                butil::IOBufAsZeroCopyOutputStream stream(
+                    &ctx->send_data, GetUrmaRecvBlockSize() + IOBUF_BLOCK_HEADER_LEN);
+                int capacity = 0;
+                if (!stream.Next(&wire, &capacity) ||
+                    capacity < static_cast<int>(sizeof(UrmaMsgHeader) + limit)) {
+                    prepare_error = ENOMEM; break;
+                }
+                ctx->header_buf = static_cast<UrmaMsgHeader*>(wire);
+                ctx->header_in_send_data = true;
+                len = remaining.copy_to(static_cast<char*>(wire) + sizeof(UrmaMsgHeader), limit);
+                stream.BackUp(capacity - sizeof(UrmaMsgHeader) - len);
             }
-            ctx->header_buf = static_cast<UrmaMsgHeader*>(wire);
-            ctx->header_in_send_data = true;
-            len = remaining.copy_to(static_cast<char*>(wire) + sizeof(UrmaMsgHeader), limit);
-            stream.BackUp(capacity - sizeof(UrmaMsgHeader) - len);
-        }
-        sge->push_back(urma_sge_t{});
-        sge[0].addr = reinterpret_cast<uint64_t>(wire);
-        sge[0].len = sizeof(UrmaMsgHeader) + len;
-        sge[0].tseg = GetPoolSegFor(wire);
+            sge->push_back(urma_sge_t{});
+            sge[0].addr = reinterpret_cast<uint64_t>(wire);
+            sge[0].len = sizeof(UrmaMsgHeader) + len;
+            sge[0].tseg = GetPoolSegFor(wire);
 #else
-        ctx->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
-        if (!ctx->header_buf) { prepare_error = ENOMEM; break; }
-        const uint32_t max_sge = slot->jfs->jfs_cfg.max_sge;
-        if (max_sge < 2) { prepare_error = EINVAL; break; }
-        sge->push_back(urma_sge_t{});
-        sge[0].addr = reinterpret_cast<uint64_t>(ctx->header_buf);
-        sge[0].len = sizeof(UrmaMsgHeader);
-        sge[0].tseg = GetHeaderPoolSegFor(ctx->header_buf);
-        for (size_t block = 0; block < remaining.backing_block_num() &&
-                len < limit && sge->size() < max_sge; ++block) {
-            const auto piece = remaining.backing_block(block);
-            urma_sge_t body{};
-            body.addr = reinterpret_cast<uint64_t>(piece.data());
-            body.len = std::min(piece.size(), limit - len);
-            body.tseg = GetPoolSegFor(const_cast<char*>(piece.data()));
-            if (!body.tseg) {
-                butil::IOBuf first_byte;
-                remaining.append_to(&first_byte, 1, len);
-                body.tseg = reinterpret_cast<urma_target_seg_t*>(
-                    static_cast<uintptr_t>(first_byte.get_first_data_meta()));
+            ctx->header_buf = static_cast<UrmaMsgHeader*>(AllocHeaderBuffer());
+            if (!ctx->header_buf) { prepare_error = ENOMEM; break; }
+            const uint32_t max_sge = slot->jfs->jfs_cfg.max_sge;
+            if (max_sge < 2) { prepare_error = EINVAL; break; }
+            sge->push_back(urma_sge_t{});
+            sge[0].addr = reinterpret_cast<uint64_t>(ctx->header_buf);
+            sge[0].len = sizeof(UrmaMsgHeader);
+            sge[0].tseg = GetHeaderPoolSegFor(ctx->header_buf);
+            for (size_t block = 0; block < remaining.backing_block_num() &&
+                    len < limit && sge->size() < max_sge; ++block) {
+                const auto piece = remaining.backing_block(block);
+                urma_sge_t body{};
+                body.addr = reinterpret_cast<uint64_t>(piece.data());
+                body.len = std::min(piece.size(), limit - len);
+                body.tseg = GetPoolSegFor(const_cast<char*>(piece.data()));
+                if (!body.tseg) {
+                    butil::IOBuf first_byte;
+                    remaining.append_to(&first_byte, 1, len);
+                    body.tseg = reinterpret_cast<urma_target_seg_t*>(
+                        static_cast<uintptr_t>(first_byte.get_first_data_meta()));
+                }
+                sge->push_back(body);
+                len += body.len;
             }
-            sge->push_back(body);
-            len += body.len;
-        }
-        remaining.append_to(&ctx->send_data, len);
+            remaining.append_to(&ctx->send_data, len);
 #endif
-        if (!len) { prepare_error = EMSGSIZE; break; }
-        for (const auto& part : sge.container()) {
-            if (!part.tseg) { prepare_error = ERDMAMEM; break; }
+            if (!len) { prepare_error = EMSGSIZE; break; }
+            for (const auto& part : sge.container()) {
+                if (!part.tseg) { prepare_error = ERDMAMEM; break; }
+            }
+            if (prepare_error) { break; }
+            std::memset(ctx->header_buf, 0, sizeof(UrmaMsgHeader));
+            ctx->header_buf->dst_socket_id = butil::HostToNet64(_peer_socket_id);
+            ctx->header_buf->seq = butil::HostToNet16(ctx->seq);
+            ctx->header_buf->type = MSG_SMALL;
+            ctx->body_bytes = len;
+            ctx->wr.opcode = URMA_OPC_SEND;
+            ctx->wr.flag.bs.complete_enable = 1;
+            ctx->wr.tjetty = _conn_res->remote_jfr;
+            ctx->wr.send.src = urma_sg_t{sge->data(), static_cast<uint32_t>(sge->size())};
+            ctx->wr.user_ctx = reinterpret_cast<uint64_t>(ctx.get());
+            batch->Append(ctx.release());
+            remaining.pop_front(len);
+            bytes += len;
         }
-        if (prepare_error) { break; }
-        std::memset(ctx->header_buf, 0, sizeof(UrmaMsgHeader));
-        ctx->header_buf->dst_socket_id = butil::HostToNet64(_peer_socket_id);
-        ctx->header_buf->seq = butil::HostToNet16(ctx->seq);
-        ctx->header_buf->type = MSG_SMALL;
-        ctx->body_bytes = len;
-        ctx->wr.opcode = URMA_OPC_SEND;
-        ctx->wr.flag.bs.complete_enable = 1;
-        ctx->wr.tjetty = _conn_res->remote_jfr;
-        ctx->wr.send.src = urma_sg_t{sge->data(), static_cast<uint32_t>(sge->size())};
-        ctx->wr.user_ctx = reinterpret_cast<uint64_t>(ctx.get());
-        batch->Append(ctx.release());
-        remaining.pop_front(len);
-        bytes += len;
+        if (!batch->count) { errno = prepare_error ? prepare_error : EAGAIN; break; }
+        const size_t accepted = batch->count;
+        if (g_urma_pool->Enqueue(slot, batch.get()) != 0) { break; }
+        batch.release(); // Queue owns node; it may already have completed.
+        total_bytes += bytes;
+        _next_send_seq = static_cast<uint16_t>(_next_send_seq + accepted);
+        // Bound preparation and keep a batch on the preferred JFS while it has room.
+        if (remaining.empty() || budget == URMA_TX_BATCH_MAX || prepare_error) { break; }
     }
-    if (!batch->count) { errno = prepare_error ? prepare_error : EAGAIN; return -1; }
-    const size_t accepted = batch->count;
-    if (g_urma_pool->Enqueue(slot, batch.get()) != 0) { return -1; }
-    batch.release(); // Queue owns node; it may already have completed.
-    size_t left = bytes;
+    if (!total_bytes) { return -1; }
+    size_t left = total_bytes;
     for (size_t j = 0; j < ndata && left; ++j) { left -= from[j]->pop_front(left); }
-    _next_send_seq = static_cast<uint16_t>(_next_send_seq + accepted);
-    return bytes;
+    return total_bytes;
 }
 
+uint32_t UrmaEndpoint::PreferredJfs() const {
+    return _preferred_jfs == UINT32_MAX
+        ? UrmaResourcePool::PreferredJfs(_self_socket_id, g_urma_pool->io_jfs.size())
+        : _preferred_jfs % g_urma_pool->io_jfs.size();
+}
 bool UrmaEndpoint::IsWritable() const {
-    return g_urma_pool && g_urma_pool->IsWritable();
+    return g_urma_pool && g_urma_pool->IsWritable(PreferredJfs());
 }
 
 void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
-    const SocketId sid = reinterpret_cast<TxCompletionCtx*>(cr.user_ctx)->self_socket_id;
     g_urma_pool->CompleteSend(slot, cr);
-    SocketUniquePtr socket;
-    if (Socket::Address(sid, &socket) == 0 && cr.status == URMA_CR_SUCCESS) {
-        socket->WakeAsEpollOut();
-    }
 }
 
 void UrmaEndpoint::HandleRxCompletion(UrmaJfrSlot* slot, const urma_cr_t& cr,

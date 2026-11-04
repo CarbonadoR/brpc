@@ -122,7 +122,8 @@ int UrmaTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
             // Same caveat as RDMA: URMA cannot detect failure by writing, so
             // after a failed butex wait we must re-check _socket->Failed().
             int rc =
-                urma::g_urma_pool->WaitWritable(epollout_butex, expected_val, &duetime);
+                urma::g_urma_pool->WaitWritable(epollout_butex, expected_val, &duetime,
+                                                  _urma_ep->PreferredJfs());
             if (rc < 0 && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
                 const int saved_errno = errno;
                 PLOG(ERROR) << "Fail to wait epollout butex";

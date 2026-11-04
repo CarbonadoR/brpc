@@ -196,6 +196,20 @@ struct UrmaIoSlot : public SocketUser {
 private:
     std::atomic<uint32_t> refs{1};
 };
+class UrmaResourcePool;
+struct UrmaJfsSlot;
+struct UrmaWriteWaiter {
+    UrmaWriteWaiter(UrmaResourcePool*, butil::atomic<int>*, UrmaJfsSlot* = nullptr);
+    ~UrmaWriteWaiter();
+    UrmaResourcePool* const pool;
+    UrmaJfsSlot* const slot;
+    butil::atomic<int>* const butex;
+    UrmaWriteWaiter* prev{nullptr};
+    UrmaWriteWaiter* next{nullptr};
+    bool queued{false};
+    UrmaWriteWaiter(const UrmaWriteWaiter&) = delete;
+    UrmaWriteWaiter& operator=(const UrmaWriteWaiter&) = delete;
+};
 struct UrmaJfsSlot : public UrmaIoSlot {
     explicit UrmaJfsSlot(uint32_t i) : UrmaIoSlot(JFS_SLOT, i) {}
     urma_jfs_t* jfs{nullptr};
@@ -209,6 +223,10 @@ struct UrmaJfsSlot : public UrmaIoSlot {
     std::atomic<unsigned> drain_state{0};
     std::unique_ptr<std::atomic<TxCompletionCtx*>[]> submitted;
     uint32_t next_registry{0};
+    // Only waiter registration/cancellation uses this mutex, never post/poll.
+    butil::Mutex writers_mutex;
+    UrmaWriteWaiter* writers{nullptr};
+    std::atomic<bool> has_writers{false};
     // Inspection at quiescent points (tests/debug), never used by CQ routing.
     std::vector<TxCompletionCtx*> SubmittedContexts() const {
         std::vector<TxCompletionCtx*> result;
@@ -242,10 +260,13 @@ public:
     virtual UrmaJfsSlot* AcquireJfs();
     UrmaJfsSlot* AcquirePreferredJfs(uint32_t preferred);
     virtual uint32_t PickJfr();
-    bool IsWritable() const;
-    // Wait on the calling Socket's butex, but register for pool-wide SQ space.
+    bool IsWritable(uint32_t preferred = 0) const;
+    static uint32_t PreferredJfs(SocketId, size_t count);
+    UrmaJfsSlot* PickBackup(uint32_t preferred) const;
+    virtual std::array<uint32_t, 4> SampleBackups(uint32_t preferred) const;
+    // The KeepWrite stack owns the waiter; only the preferred JFS notifies it.
     int WaitWritable(butil::atomic<int>* butex, int expected,
-                     const timespec* deadline);
+                     const timespec* deadline, uint32_t preferred = 0);
     // Every returned reservation, including post failures, may unblock peers.
     void ReleaseJfs(UrmaJfsSlot* slot);
     virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*,
@@ -269,27 +290,12 @@ private:
     void CollectIncoming(UrmaJfsSlot*);
     void DrainSendQueue(UrmaJfsSlot*);
     void CancelQueued(UrmaJfsSlot*);
-    struct WriteWaiter {
-        WriteWaiter(UrmaResourcePool* p, butil::atomic<int>* b)
-            : pool(p), butex(b) { pool->_active_writers.fetch_add(1); }
-        ~WriteWaiter();
-        UrmaResourcePool* const pool;
-        butil::atomic<int>* const butex;
-        WriteWaiter* prev{nullptr};
-        WriteWaiter* next{nullptr};
-        bool queued{false};
-        WriteWaiter(const WriteWaiter&) = delete;
-        WriteWaiter& operator=(const WriteWaiter&) = delete;
-    };
+    friend struct UrmaWriteWaiter;
+    using WriteWaiter = UrmaWriteWaiter;
     void RemoveWriterLocked(WriteWaiter* waiter);
-    void WakeWritersLocked();
-    // Never acquire a slot lock while holding this mutex. Waking a butex
-    // neither yields nor executes the awakened writer inline.
-    butil::Mutex _writers_mutex;
-    WriteWaiter* _writers{nullptr};
-    std::atomic<bool> _has_writers{false};
+    void WakeWritersLocked(UrmaJfsSlot*, bool all = false);
     std::atomic<uint32_t> _active_writers{0};
-    bool _writers_closed{false};
+    std::atomic<bool> _writers_closed{false};
     int CreateCompletionQueue(urma_context_t*, UrmaIoSlot*, uint32_t);
     EventAdapter _events;
 };

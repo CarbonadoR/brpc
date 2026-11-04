@@ -656,6 +656,11 @@ protected:
             }
             return UrmaResourcePool::RepostRecv(slot, ctx);
         }
+        std::array<uint32_t, 4> SampleBackups(uint32_t preferred) const override {
+            return backup_sample ? backup_sample(preferred) :
+                UrmaResourcePool::SampleBackups(preferred);
+        }
+        std::function<std::array<uint32_t, 4>(uint32_t)> backup_sample;
         std::function<void()> before_post;
         std::vector<size_t> post_chain_sizes;
         bool fail_next_repost{false};
@@ -704,11 +709,11 @@ protected:
             urma::g_urma_pool = _original;
         }
     }
-    void Reconfigure(uint32_t sq_depth, uint32_t rx_depth) {
+    void Reconfigure(uint32_t sq_depth, uint32_t rx_depth, uint32_t jfs_count = 1) {
         ASSERT_TRUE(_sockets.empty());
         ASSERT_TRUE(_pool->Shutdown());
         _pool.reset(new RecordingPool);
-        urma::FLAGS_urma_io_jfs_cnt = 1;
+        urma::FLAGS_urma_io_jfs_cnt = jfs_count;
         urma::FLAGS_urma_io_jfr_cnt = 1;
         urma::FLAGS_urma_io_sq_depth = sq_depth;
         urma::FLAGS_urma_io_rx_depth = rx_depth;
@@ -1516,7 +1521,7 @@ TEST_F(UrmaPooledTest, jfs_affinity_distributes_more_connections_than_queues) {
                   sender->CutFromIOBufList(input, 1));
         ASSERT_GT(_pool->send_jfs_indices.size(), first);
         for (size_t i = first; i < _pool->send_jfs_indices.size(); ++i) {
-            EXPECT_EQ(connection % _pool->io_jfs.size(),
+            EXPECT_EQ(urma::UrmaResourcePool::PreferredJfs(sender->_self_socket_id, _pool->io_jfs.size()),
                       _pool->send_jfs_indices[i]);
         }
         DrainTx();
@@ -1531,6 +1536,7 @@ TEST_F(UrmaPooledTest, jfs_affinity_falls_back_then_returns_to_preferred_queue) 
     ASSERT_TRUE(sender && receiver);
     Connect(sender, receiver);
     ASSERT_EQ(2u, _pool->io_jfs.size());
+    sender->_preferred_jfs = 0;
     auto* preferred = _pool->io_jfs[0];
     auto send = [&] {
         butil::IOBuf data;
@@ -1579,6 +1585,91 @@ TEST_F(UrmaPooledTest, jfs_affinity_disabled_rotates_batches_not_individual_wrs)
     DrainRx();
 }
 
+TEST_F(UrmaPooledTest, random_backup_candidates_are_unique_and_exclude_preferred) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    for (const uint32_t count : {1u, 2u, 5u, 6u, 16u}) {
+        Reconfigure(16, 8, count);
+        for (uint32_t preferred = 0; preferred < count; ++preferred) {
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                const auto sample = _pool->SampleBackups(preferred);
+                std::set<uint32_t> unique;
+                for (size_t i = 0; i < std::min<size_t>(4, count - 1); ++i) {
+                    EXPECT_LT(sample[i], count);
+                    EXPECT_NE(preferred, sample[i]);
+                    EXPECT_TRUE(unique.insert(sample[i]).second);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(UrmaPooledTest, backup_selects_minimum_of_four_without_global_scan) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    Reconfigure(16, 8, 6);
+    _pool->backup_sample = [](uint32_t) { return std::array<uint32_t, 4>{1, 2, 3, 4}; };
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(16); }
+    _pool->io_jfs[5]->sq_inflight.store(0); // Free global queue outside sample.
+    EXPECT_EQ(nullptr, _pool->PickBackup(0));
+    EXPECT_EQ(EAGAIN, errno);
+    _pool->io_jfs[3]->sq_inflight.store(12);
+    _pool->io_jfs[2]->sq_inflight.store(15);
+    EXPECT_EQ(_pool->io_jfs[3], _pool->PickBackup(0));
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
+TEST_F(UrmaPooledTest, preferred_and_one_backup_accept_prefix_then_eagain) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    Reconfigure(16, 128, 6);
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_TRUE(sender && receiver);
+    Connect(sender, receiver);
+    sender->_preferred_jfs = 0;
+    _pool->backup_sample = [](uint32_t) { return std::array<uint32_t, 4>{1, 2, 3, 4}; };
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(16); }
+    _pool->io_jfs[0]->sq_inflight.store(15);
+    _pool->io_jfs[2]->sq_inflight.store(14);
+    _pool->io_jfs[5]->sq_inflight.store(0); // Must remain untouched.
+    butil::IOBuf data;
+    data.append(std::string(4 * 4032, 'q'));
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(3 * 4032, sender->CutFromIOBufList(input, 1));
+    EXPECT_EQ((std::vector<uint32_t>{0, 2, 2}), _pool->send_jfs_indices);
+    EXPECT_EQ(4032u, data.size());
+    EXPECT_EQ(-1, sender->CutFromIOBufList(input, 1));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(4032u, data.size());
+    EXPECT_EQ(3u, sender->_next_send_seq);
+    DrainRx();
+    DrainTx();
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+    ASSERT_EQ(4032, sender->CutFromIOBufList(input, 1));
+    DrainRx();
+    DrainTx();
+    EXPECT_EQ(std::string(4 * 4032, 'q'), receiver->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, backup_completion_does_not_notify_preferred_waiter) {
+    auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
+    bx->store(0);
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(slot->sq_depth); }
+    std::atomic<int> result{-2};
+    std::thread writer([&] {
+        const auto deadline = butil::milliseconds_from_now(1000);
+        const int rc = _pool->WaitWritable(bx, 0, &deadline, 0);
+        result.store(rc == 0 || errno == EWOULDBLOCK ? 0 : errno);
+    });
+    while (!_pool->io_jfs[0]->has_writers.load()) { std::this_thread::yield(); }
+    _pool->ReleaseJfs(_pool->io_jfs[1]);
+    EXPECT_EQ(0, bx->load());
+    EXPECT_FALSE(_pool->IsWritable(0));
+    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    writer.join();
+    EXPECT_EQ(0, result.load());
+    bthread::butex_destroy(bx);
+    for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
+}
+
 TEST_F(UrmaPooledTest, shared_sq_completion_wakes_other_connection) {
     auto* waiting = Endpoint();
     auto* sender = Endpoint();
@@ -1591,6 +1682,7 @@ TEST_F(UrmaPooledTest, shared_sq_completion_wakes_other_connection) {
     data.append("complete on a different connection");
     butil::IOBuf* input[] = {&data};
     ASSERT_GT(sender->CutFromIOBufList(input, 1), 0);
+    waiting->_preferred_jfs = sender->PreferredJfs();
     // Reserve the rest of the shared capacity, without any WR owned by waiting.
     while (_pool->AcquireJfs()) {}
     ASSERT_FALSE(_pool->IsWritable());
@@ -1621,18 +1713,18 @@ TEST_F(UrmaPooledTest, shared_sq_wait_handles_preexisting_space_and_notification
     auto deadline = butil::milliseconds_from_now(100);
     // Completion before registration: never sleep with space already available.
     EXPECT_EQ(0, _pool->WaitWritable(bx, 0, &deadline));
-    EXPECT_FALSE(_pool->_has_writers.load());
+    EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     while (_pool->AcquireJfs()) {}
     // An earlier Socket notification must not be lost before entering wait.
     bx->fetch_add(1);
     EXPECT_EQ(-1, _pool->WaitWritable(bx, 0, &deadline));
     EXPECT_EQ(EWOULDBLOCK, errno);
-    EXPECT_FALSE(_pool->_has_writers.load());
+    EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     // Timed-out stack waiters must be removed before their butex is freed.
     deadline = butil::milliseconds_from_now(2);
     EXPECT_EQ(-1, _pool->WaitWritable(bx, 1, &deadline));
     EXPECT_EQ(ETIMEDOUT, errno);
-    EXPECT_FALSE(_pool->_has_writers.load());
+    EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     bthread::butex_destroy(bx);
     _pool->ReleaseJfs(_pool->io_jfs[0]);
     for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
@@ -1651,7 +1743,7 @@ TEST_F(UrmaPooledTest, shared_sq_wait_registration_races_credit_release) {
             ++timeouts;
         }
         release.join();
-        EXPECT_FALSE(_pool->_has_writers.load());
+        EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     }
     EXPECT_EQ(0, timeouts.load());
     bthread::butex_destroy(bx);
@@ -1677,9 +1769,9 @@ TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
         size_t queued = 0;
         do {
             {
-                BAIDU_SCOPED_LOCK(_pool->_writers_mutex);
+                BAIDU_SCOPED_LOCK(_pool->io_jfs[0]->writers_mutex);
                 queued = 0;
-                for (auto* node = _pool->_writers; node; node = node->next) { ++queued; }
+                for (auto* node = _pool->io_jfs[0]->writers; node; node = node->next) { ++queued; }
             }
             if (queued == static_cast<size_t>(i + 1)) { break; }
             std::this_thread::yield();
@@ -1692,12 +1784,13 @@ TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
     writers[1].join();
     bthread::butex_destroy(bx[1]);
     _pool->ReleaseJfs(_pool->io_jfs[0]);
+    _pool->ReleaseJfs(_pool->io_jfs[0]);
     for (int i : {0, 2}) {
         writers[i].join();
         bthread::butex_destroy(bx[i]);
     }
     EXPECT_EQ(0, timeouts.load());
-    EXPECT_FALSE(_pool->_has_writers.load());
+    EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
 }
 
@@ -1711,11 +1804,11 @@ TEST_F(UrmaPooledTest, shared_sq_shutdown_notifies_registered_waiters) {
         const int rc = _pool->WaitWritable(bx, 0, &deadline);
         result.store(rc == 0 || errno == EWOULDBLOCK ? 0 : errno);
     });
-    while (!_pool->_has_writers.load()) { std::this_thread::yield(); }
+    while (!_pool->io_jfs[0]->has_writers.load()) { std::this_thread::yield(); }
     EXPECT_TRUE(_pool->Shutdown());
     writer.join();
     EXPECT_EQ(0, result.load());
-    EXPECT_FALSE(_pool->_has_writers.load());
+    EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     const auto deadline = butil::milliseconds_from_now(1);
     EXPECT_EQ(-1, _pool->WaitWritable(bx, bx->load(), &deadline));
     EXPECT_EQ(EIO, errno);
@@ -1741,8 +1834,8 @@ TEST_F(UrmaPooledTest, shared_sq_shutdown_drains_returning_guards) {
     for (;;) {
         bool closed;
         {
-            BAIDU_SCOPED_LOCK(_pool->_writers_mutex);
-            closed = _pool->_writers_closed;
+            BAIDU_SCOPED_LOCK(_pool->io_jfs[0]->writers_mutex);
+            closed = _pool->_writers_closed.load();
         }
         if (closed) { break; }
         std::this_thread::yield();

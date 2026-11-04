@@ -196,88 +196,139 @@ UrmaJfsSlot* UrmaResourcePool::AcquirePreferredJfs(uint32_t preferred) {
 uint32_t UrmaResourcePool::PickJfr() {
     return jfr_rr_counter.fetch_add(1, std::memory_order_relaxed) % io_jfr.size();
 }
-bool UrmaResourcePool::IsWritable() const {
-    for (const auto* slot : io_jfs) {
-        if (!slot->stopped.load() && slot->sq_inflight.load() < slot->sq_depth) {
-            return true;
+namespace {
+uint64_t Mix64(uint64_t value) {
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+uint64_t RotateLeft(uint64_t value, unsigned bits) {
+    return (value << bits) | (value >> (64 - bits));
+}
+struct JfsRandom {
+    JfsRandom() {
+        static std::atomic<uint64_t> sequence{1};
+        uint64_t seed = sequence.fetch_add(1, std::memory_order_relaxed) ^
+            std::hash<std::thread::id>()(std::this_thread::get_id());
+        for (auto& item : state) {
+            seed += UINT64_C(0x9e3779b97f4a7c15);
+            item = Mix64(seed);
         }
     }
-    return false;
+    uint64_t Next() { // xoshiro256++; each pthread owns its state.
+        const uint64_t result = RotateLeft(state[0] + state[3], 23) + state[0];
+        const uint64_t t = state[1] << 17;
+        state[2] ^= state[0]; state[3] ^= state[1];
+        state[1] ^= state[2]; state[0] ^= state[3];
+        state[2] ^= t; state[3] = RotateLeft(state[3], 45);
+        return result;
+    }
+    uint64_t state[4];
+};
 }
-UrmaResourcePool::WriteWaiter::~WriteWaiter() {
+uint32_t UrmaResourcePool::PreferredJfs(SocketId sid, size_t count) {
+    return count ? Mix64(sid) % count : 0;
+}
+std::array<uint32_t, 4> UrmaResourcePool::SampleBackups(uint32_t preferred) const {
+    std::array<uint32_t, 4> candidates{};
+    preferred %= io_jfs.size();
+    const size_t count = std::min<size_t>(4, io_jfs.size() - 1);
+    if (io_jfs.size() <= 5) {
+        for (size_t i = 0; i < count; ++i) {
+            candidates[i] = (preferred + 1 + i) % io_jfs.size();
+        }
+    } else {
+        thread_local JfsRandom random;
+        for (size_t i = 0; i < count;) {
+            const uint32_t candidate = random.Next() % io_jfs.size();
+            if (candidate == preferred ||
+                std::find(candidates.begin(), candidates.begin() + i, candidate) != candidates.begin() + i) { continue; }
+            candidates[i++] = candidate;
+        }
+    }
+    return candidates;
+}
+UrmaJfsSlot* UrmaResourcePool::PickBackup(uint32_t preferred) const {
+    if (io_jfs.size() <= 1) { errno = EAGAIN; return nullptr; }
+    const auto candidates = SampleBackups(preferred);
+    const size_t count = std::min<size_t>(4, io_jfs.size() - 1);
+    UrmaJfsSlot* best = nullptr;
+    uint32_t lowest = UINT32_MAX;
+    for (size_t i = 0; i < count; ++i) {
+        auto* slot = io_jfs[candidates[i]];
+        const uint32_t used = slot->sq_inflight.load(std::memory_order_relaxed);
+        if (!slot->stopped.load() && used < lowest) { lowest = used; best = slot; }
+    }
+    if (!best || lowest >= best->sq_depth) { errno = EAGAIN; return nullptr; }
+    return best;
+}
+bool UrmaResourcePool::IsWritable(uint32_t preferred) const {
+    if (_writers_closed.load() || io_jfs.empty()) { return false; }
+    auto* slot = io_jfs[preferred % io_jfs.size()];
+    return !slot->stopped.load() && slot->sq_inflight.load() < slot->sq_depth;
+}
+UrmaWriteWaiter::UrmaWriteWaiter(UrmaResourcePool* p, butil::atomic<int>* b,
+                               UrmaJfsSlot* s)
+    : pool(p), slot(s ? s : p->io_jfs[0]), butex(b) {
+    pool->_active_writers.fetch_add(1);
+}
+UrmaWriteWaiter::~UrmaWriteWaiter() {
     const int saved_errno = errno;
     {
-        BAIDU_SCOPED_LOCK(pool->_writers_mutex);
+        BAIDU_SCOPED_LOCK(slot->writers_mutex);
         pool->RemoveWriterLocked(this);
     }
-    // Last access to the pool: Shutdown waits for returning guards as well
-    // as queued waiters before allowing the pool mutex to be destroyed.
     pool->_active_writers.fetch_sub(1);
     errno = saved_errno;
 }
-
 void UrmaResourcePool::RemoveWriterLocked(WriteWaiter* waiter) {
     if (!waiter->queued) { return; }
+    auto* slot = waiter->slot;
     if (waiter->prev) { waiter->prev->next = waiter->next; }
-    else { _writers = waiter->next; }
+    else { slot->writers = waiter->next; }
     if (waiter->next) { waiter->next->prev = waiter->prev; }
     waiter->queued = false;
-    _has_writers.store(_writers != nullptr);
+    slot->has_writers.store(slot->writers != nullptr);
 }
-
-void UrmaResourcePool::WakeWritersLocked() {
-    while (_writers) {
-        auto* waiter = _writers;
+void UrmaResourcePool::WakeWritersLocked(UrmaJfsSlot* slot, bool all) {
+    while (slot->writers) {
+        auto* waiter = slot->writers;
         RemoveWriterLocked(waiter);
-        // Cancellation must acquire _writers_mutex before the stack node or
-        // its Socket butex can disappear. Do not retain either after unlocking.
         waiter->butex->fetch_add(1, butil::memory_order_release);
         bthread::butex_wake_except(waiter->butex, INVALID_BTHREAD);
+        if (!all) { break; }
     }
 }
-
 int UrmaResourcePool::WaitWritable(butil::atomic<int>* butex, int expected,
-                                    const timespec* deadline) {
-    WriteWaiter waiter(this, butex);
+                                 const timespec* deadline, uint32_t preferred) {
+    UrmaOperation active(&operations);
+    if (!active || io_jfs.empty()) { errno = EIO; return -1; }
+    auto* slot = io_jfs[preferred % io_jfs.size()];
+    WriteWaiter waiter(this, butex, slot);
     {
-        BAIDU_SCOPED_LOCK(_writers_mutex);
-        if (_writers_closed) { errno = EIO; return -1; }
-        waiter.next = _writers;
-        if (_writers) { _writers->prev = &waiter; }
-        _writers = &waiter;
+        BAIDU_SCOPED_LOCK(slot->writers_mutex);
+        if (_writers_closed.load() || slot->stopped.load()) { errno = EIO; return -1; }
+        waiter.next = slot->writers;
+        if (slot->writers) { slot->writers->prev = &waiter; }
+        slot->writers = &waiter;
         waiter.queued = true;
-        // Publish BEFORE checking space. Together with the sequentially
-        // consistent credit decrement/check in ReleaseJfs, this prevents both
-        // sides missing each other when completion races registration.
-        _has_writers.store(true);
-        if (IsWritable()) {
-            RemoveWriterLocked(&waiter);
-            return 0;
-        }
+        // Publish before rechecking space; pair with SC credit release.
+        slot->has_writers.store(true);
+        if (IsWritable(preferred)) { RemoveWriterLocked(&waiter); return 0; }
     }
-    // The caller sampled expected before checking writability. A notification
-    // before this wait changes the butex value and produces EWOULDBLOCK.
-    // The stack guard unregisters before returning and preserves errno.
     return bthread::butex_wait(butex, expected, deadline);
 }
-
 void UrmaResourcePool::ReleaseJfs(UrmaJfsSlot* slot) {
     slot->sq_inflight.fetch_sub(1);
-    // No allocations, mutex acquisitions or connection scans without waiters.
-    if (!_has_writers.load()) { return; }
-    BAIDU_SCOPED_LOCK(_writers_mutex);
-    WakeWritersLocked();
+    if (!slot->has_writers.load()) { return; }
+    BAIDU_SCOPED_LOCK(slot->writers_mutex);
+    WakeWritersLocked(slot);
 }
-
-UrmaJfsSlot* UrmaResourcePool::SelectJfs(uint32_t preferred, bool affinity) const {
+UrmaJfsSlot* UrmaResourcePool::SelectJfs(uint32_t preferred, bool) const {
     if (io_jfs.empty()) { errno = ENODEV; return nullptr; }
-    (void)affinity;
-    for (size_t i = 0; i < io_jfs.size(); ++i) {
-        auto* slot = io_jfs[(preferred + i) % io_jfs.size()];
-        if (!slot->stopped.load() && slot->sq_inflight.load() < slot->sq_depth) { return slot; }
-    }
-    errno = EAGAIN;
-    return nullptr;
+    auto* slot = io_jfs[preferred % io_jfs.size()];
+    if (!slot->stopped.load() && slot->sq_inflight.load() < slot->sq_depth) { return slot; }
+    return PickBackup(preferred);
 }
 
 int UrmaResourcePool::PostSend(UrmaJfsSlot* slot, urma_jfs_wr_t* wr,
@@ -343,7 +394,7 @@ void UrmaResourcePool::CancelQueued(UrmaJfsSlot* slot) {
         auto* ctx = slot->pending_head->items[slot->pending_head->begin];
         FailTxContext(ctx, EIO, "URMA send queue closed");
         RemoveQueueFront(slot);
-        slot->sq_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        slot->sq_inflight.fetch_sub(1);
         ctx->Release();
     }
 }
@@ -356,7 +407,7 @@ void UrmaResourcePool::DrainSendQueue(UrmaJfsSlot* slot) {
         auto* first = slot->pending_head->items[slot->pending_head->begin];
         if (first->connection && first->connection->failed.load(std::memory_order_acquire)) {
             RemoveQueueFront(slot);
-            slot->sq_inflight.fetch_sub(1, std::memory_order_acq_rel);
+            slot->sq_inflight.fetch_sub(1);
             first->Release();
             continue;
         }
@@ -435,9 +486,13 @@ void UrmaResourcePool::KickDrain(UrmaJfsSlot* slot) {
     for (;;) {
         slot->drain_state.fetch_and(~unsigned(UrmaJfsSlot::KICK), std::memory_order_acq_rel);
         DrainSendQueue(slot);
-        if (_has_writers.load() && IsWritable()) {
-            BAIDU_SCOPED_LOCK(_writers_mutex);
-            WakeWritersLocked();
+        if (slot->has_writers.load()) {
+            BAIDU_SCOPED_LOCK(slot->writers_mutex);
+            if (slot->stopped.load() || _writers_closed.load()) {
+                WakeWritersLocked(slot, true);
+            } else if (IsWritable(slot->index)) {
+                WakeWritersLocked(slot);
+            }
         }
         unsigned expected = UrmaJfsSlot::RUNNING;
         if (slot->drain_state.compare_exchange_strong(expected, 0,
@@ -449,7 +504,7 @@ void UrmaResourcePool::CompleteSend(UrmaJfsSlot* slot, const urma_cr_t& cr) {
     auto* ctx = reinterpret_cast<TxCompletionCtx*>(cr.user_ctx);
     slot->submitted[ctx->registry_index].store(nullptr, std::memory_order_release);
     slot->sq_device_inflight.fetch_sub(1, std::memory_order_acq_rel);
-    slot->sq_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    slot->sq_inflight.fetch_sub(1);
     if (cr.status != URMA_CR_SUCCESS) {
         FailTxContext(ctx, EIO, "URMA send completion failed");
     }
@@ -513,10 +568,10 @@ int UrmaResourcePool::RepostRecv(UrmaJfrSlot& slot, RxRecvCtx* context) {
 
 bool UrmaResourcePool::Shutdown() {
     operations.Close();
-    {
-        BAIDU_SCOPED_LOCK(_writers_mutex);
-        _writers_closed = true;
-        WakeWritersLocked();
+    _writers_closed.store(true);
+    for (auto* slot : io_jfs) {
+        BAIDU_SCOPED_LOCK(slot->writers_mutex);
+        WakeWritersLocked(slot, true);
     }
     while (_active_writers.load() != 0 || !operations.Idle()) { std::this_thread::yield(); }
     for (auto* slot : io_jfs) {
