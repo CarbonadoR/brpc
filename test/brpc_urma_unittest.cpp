@@ -628,9 +628,29 @@ protected:
                      urma::TxCompletionCtx* ctx, urma_jfs_wr_t** bad = nullptr) override {
             if (before_post) { before_post(); }
             const size_t before = sends.size();
-            const int rc = UrmaResourcePool::PostSend(slot, wr, ctx, bad);
-            if (rc == 0) {
-                for (auto* item = wr; item; item = item->next) {
+            int rc;
+            urma_jfs_wr_t* rejected = nullptr;
+            if (fail_post_after >= 0) {
+                int prefix = fail_post_after;
+                fail_post_after = -1;
+                auto* tail = wr;
+                rejected = wr;
+                while (prefix-- > 0 && rejected) { tail = rejected; rejected = rejected->next; }
+                CHECK(rejected);
+                if (tail != rejected) {
+                    tail->next = nullptr;
+                    rc = UrmaResourcePool::PostSend(slot, wr, ctx, bad);
+                    tail->next = rejected;
+                    CHECK_EQ(0, rc);
+                }
+                rc = -1;
+                *bad = rejected;
+                errno = injected_post_error;
+            } else {
+                rc = UrmaResourcePool::PostSend(slot, wr, ctx, bad);
+            }
+            if (rc == 0 || (rejected && rejected != wr)) {
+                for (auto* item = wr; item && item != rejected; item = item->next) {
                     send_jfs_indices.push_back(slot->index);
                     sends.emplace_back(item->send.src.sge,
                                        item->send.src.sge + item->send.src.num_sge);
@@ -646,6 +666,7 @@ protected:
                     completed_data = ctx->send_data.to_string();
                 }
             }
+            if (rejected) { errno = injected_post_error; }
             return rc;
         }
         int RepostRecv(urma::UrmaJfrSlot& slot, urma::RxRecvCtx* ctx) override {
@@ -665,6 +686,8 @@ protected:
         std::function<void()> before_post;
         std::function<void()> before_repost;
         std::vector<size_t> post_chain_sizes;
+        int fail_post_after{-1};
+        int injected_post_error{URMA_EINVAL};
         bool fail_next_repost{false};
         bool complete_before_return{false};
         std::string completed_data;
@@ -760,6 +783,13 @@ protected:
                 urma::UrmaEndpoint::HandleRxCompletion(slot, completion);
             }
         }
+    }
+    void FillCapacity() {
+        for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(slot->sq_depth); }
+    }
+    void ReleaseCredit(urma::UrmaJfsSlot* slot) {
+        slot->sq_inflight.fetch_sub(1);
+        _pool->KickDrain(slot);
     }
     void CheckBlockingCallback();
     std::unique_ptr<RecordingPool> _pool;
@@ -986,6 +1016,144 @@ TEST_F(UrmaPooledTest, collector_waits_for_published_node_link) {
     DrainRx();
     DrainTx();
     EXPECT_EQ("linked", receiver->_input_processor.read_buf().to_string());
+}
+
+TEST_F(UrmaPooledTest, partial_fatal_post_cancels_only_failed_connection_suffix) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    Reconfigure(16, 16);
+    auto* a = Endpoint();
+    auto* a_receiver = Endpoint();
+    auto* b = Endpoint();
+    auto* b_receiver = Endpoint();
+    ASSERT_TRUE(a && a_receiver && b && b_receiver);
+    Connect(a, a_receiver);
+    Connect(b, b_receiver);
+    std::weak_ptr<urma::UrmaConnResource> resource = a->_conn_res;
+    auto* slot = _pool->io_jfs[0];
+    slot->drain_state.store(urma::UrmaJfsSlot::RUNNING);
+    butil::IOBuf data;
+    data.append(std::string(3 * 4032, 'a'));
+    butil::IOBuf* input[] = {&data};
+    ASSERT_EQ(3 * 4032, a->CutFromIOBufList(input, 1));
+    data.append("b");
+    ASSERT_EQ(1, b->CutFromIOBufList(input, 1));
+    _pool->fail_post_after = 1;
+    _pool->injected_post_error = URMA_EINVAL;
+    slot->drain_state.store(0);
+    _pool->KickDrain(slot);
+    EXPECT_TRUE(_sockets[0]->Failed());
+    EXPECT_FALSE(_sockets[2]->Failed());
+    EXPECT_FALSE(slot->stopped.load());
+    EXPECT_EQ(2u, slot->sq_inflight.load());
+    EXPECT_EQ(2u, slot->sq_device_inflight.load());
+    EXPECT_EQ(2u, _pool->sends.size());
+    a->Reset();
+    EXPECT_FALSE(resource.expired()); // Accepted prefix retains DMA/imports.
+    DrainRx();
+    DrainTx();
+    EXPECT_TRUE(resource.expired());
+    EXPECT_EQ("b", b_receiver->_input_processor.read_buf().to_string());
+    EXPECT_EQ(0u, slot->sq_inflight.load());
+    EXPECT_EQ(nullptr, slot->pending_head);
+}
+
+TEST_F(UrmaPooledTest, transient_post_without_any_future_cqe_fails_instead_of_stalling) {
+    auto* sender = Endpoint();
+    auto* receiver = Endpoint();
+    ASSERT_TRUE(sender && receiver);
+    Connect(sender, receiver);
+    _pool->fail_post_after = 0;
+    _pool->injected_post_error = URMA_EAGAIN;
+    butil::IOBuf data;
+    data.append("owned");
+    butil::IOBuf* input[] = {&data};
+    EXPECT_EQ(5, sender->CutFromIOBufList(input, 1));
+    EXPECT_TRUE(data.empty());
+    EXPECT_TRUE(_sockets[0]->Failed());
+    for (auto* slot : _pool->io_jfs) {
+        EXPECT_EQ(0u, slot->sq_inflight.load());
+        EXPECT_EQ(0u, slot->sq_device_inflight.load());
+        EXPECT_EQ(0u, slot->drain_state.load());
+        EXPECT_TRUE(slot->SubmittedContexts().empty());
+    }
+}
+
+TEST_F(UrmaPooledTest, fatal_post_stops_queue_and_cancels_other_queued_connections) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    Reconfigure(16, 16);
+    auto* a = Endpoint();
+    auto* a_receiver = Endpoint();
+    auto* b = Endpoint();
+    auto* b_receiver = Endpoint();
+    ASSERT_TRUE(a && a_receiver && b && b_receiver);
+    Connect(a, a_receiver);
+    Connect(b, b_receiver);
+    auto* slot = _pool->io_jfs[0];
+    slot->drain_state.store(urma::UrmaJfsSlot::RUNNING);
+    for (auto* sender : {a, b}) {
+        butil::IOBuf data;
+        data.append("cancel");
+        butil::IOBuf* input[] = {&data};
+        ASSERT_EQ(6, sender->CutFromIOBufList(input, 1));
+    }
+    _pool->fail_post_after = 0;
+    _pool->injected_post_error = EIO;
+    slot->drain_state.store(0);
+    _pool->KickDrain(slot);
+    EXPECT_TRUE(slot->stopped.load());
+    EXPECT_TRUE(_sockets[0]->Failed());
+    EXPECT_TRUE(_sockets[2]->Failed());
+    EXPECT_EQ(0u, slot->sq_inflight.load());
+    EXPECT_EQ(0u, slot->sq_device_inflight.load());
+    EXPECT_EQ(nullptr, slot->incoming_head.load());
+    EXPECT_EQ(nullptr, slot->pending_head);
+    butil::IOBuf data;
+    data.append("unchanged");
+    butil::IOBuf* input[] = {&data};
+    EXPECT_EQ(-1, a->CutFromIOBufList(input, 1));
+    EXPECT_EQ("unchanged", data.to_string());
+}
+
+TEST_F(UrmaPooledTest, shutdown_waits_for_post_owner_and_queued_producers) {
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    Reconfigure(16, 16);
+    auto* a = Endpoint();
+    auto* ar = Endpoint();
+    auto* b = Endpoint();
+    auto* br = Endpoint();
+    ASSERT_TRUE(a && ar && b && br);
+    Connect(a, ar);
+    Connect(b, br);
+    std::atomic<bool> entered{false}, release{false}, closed{false};
+    _pool->before_post = [&] {
+        entered.store(true);
+        while (!release.load()) { std::this_thread::yield(); }
+    };
+    auto send = [](urma::UrmaEndpoint* sender) {
+        butil::IOBuf data;
+        data.append("close");
+        butil::IOBuf* input[] = {&data};
+        EXPECT_EQ(5, sender->CutFromIOBufList(input, 1));
+    };
+    std::thread owner(send, a);
+    while (!entered.load()) { std::this_thread::yield(); }
+    send(b); // Published behind the blocked owner, returns immediately.
+    std::thread shutdown([&] { EXPECT_TRUE(_pool->Shutdown()); closed.store(true); });
+    while (!_pool->_writers_closed.load()) { std::this_thread::yield(); }
+    EXPECT_FALSE(closed.load());
+    EXPECT_NE(nullptr, _pool->io_jfs[0]->jfs);
+    EXPECT_EQ(2u, _pool->io_jfs[0]->sq_inflight.load());
+    release.store(true);
+    owner.join();
+    shutdown.join();
+    EXPECT_TRUE(closed.load());
+    auto* slot = _pool->io_jfs[0];
+    EXPECT_EQ(nullptr, slot->jfs);
+    EXPECT_EQ(nullptr, slot->pending_head);
+    EXPECT_EQ(nullptr, slot->incoming_head.load());
+    EXPECT_EQ(0u, slot->sq_inflight.load());
+    EXPECT_EQ(0u, slot->sq_device_inflight.load());
+    EXPECT_TRUE(slot->SubmittedContexts().empty());
 }
 
 TEST_F(UrmaPooledTest, independent_queues_and_import_cache) {
@@ -1601,8 +1769,8 @@ TEST_F(UrmaPooledTest, jfs_affinity_falls_back_then_returns_to_preferred_queue) 
     send();
     EXPECT_EQ((std::vector<uint32_t>{1, 0, 1, 0}), _pool->send_jfs_indices);
     EXPECT_EQ("xxxx", receiver->_input_processor.read_buf().to_string());
-    while (_pool->AcquireJfs()) {}
-    EXPECT_EQ(nullptr, _pool->AcquirePreferredJfs(0));
+    FillCapacity();
+    EXPECT_EQ(nullptr, _pool->PickBackup(0));
     EXPECT_EQ(EAGAIN, errno);
     EXPECT_FALSE(_pool->IsWritable());
     for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
@@ -1705,10 +1873,10 @@ TEST_F(UrmaPooledTest, backup_completion_does_not_notify_preferred_waiter) {
         result.store(rc == 0 || errno == EWOULDBLOCK ? 0 : errno);
     });
     while (!_pool->io_jfs[0]->has_writers.load()) { std::this_thread::yield(); }
-    _pool->ReleaseJfs(_pool->io_jfs[1]);
+    ReleaseCredit(_pool->io_jfs[1]);
     EXPECT_EQ(0, bx->load());
     EXPECT_FALSE(_pool->IsWritable(0));
-    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    ReleaseCredit(_pool->io_jfs[0]);
     writer.join();
     EXPECT_EQ(0, result.load());
     bthread::butex_destroy(bx);
@@ -1729,7 +1897,7 @@ TEST_F(UrmaPooledTest, shared_sq_completion_wakes_other_connection) {
     ASSERT_GT(sender->CutFromIOBufList(input, 1), 0);
     waiting->_preferred_jfs = sender->PreferredJfs();
     // Reserve the rest of the shared capacity, without any WR owned by waiting.
-    while (_pool->AcquireJfs()) {}
+    FillCapacity();
     ASSERT_FALSE(_pool->IsWritable());
     auto* socket = _sockets[0].get();
     auto* transport = static_cast<UrmaTransport*>(socket->_transport.get());
@@ -1759,7 +1927,7 @@ TEST_F(UrmaPooledTest, shared_sq_wait_handles_preexisting_space_and_notification
     // Completion before registration: never sleep with space already available.
     EXPECT_EQ(0, _pool->WaitWritable(bx, 0, &deadline));
     EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
-    while (_pool->AcquireJfs()) {}
+    FillCapacity();
     // An earlier Socket notification must not be lost before entering wait.
     bx->fetch_add(1);
     EXPECT_EQ(-1, _pool->WaitWritable(bx, 0, &deadline));
@@ -1771,7 +1939,7 @@ TEST_F(UrmaPooledTest, shared_sq_wait_handles_preexisting_space_and_notification
     EXPECT_EQ(ETIMEDOUT, errno);
     EXPECT_FALSE(_pool->io_jfs[0]->has_writers.load());
     bthread::butex_destroy(bx);
-    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    ReleaseCredit(_pool->io_jfs[0]);
     for (auto* slot : _pool->io_jfs) { slot->sq_inflight.store(0); }
 }
 
@@ -1780,9 +1948,9 @@ TEST_F(UrmaPooledTest, shared_sq_wait_registration_races_credit_release) {
     bx->store(0);
     std::atomic<int> timeouts{0};
     for (int i = 0; i < 200; ++i) {
-        while (_pool->AcquireJfs()) {}
+        FillCapacity();
         const int expected = bx->load();
-        std::thread release([&] { _pool->ReleaseJfs(_pool->io_jfs[0]); });
+        std::thread release([&] { ReleaseCredit(_pool->io_jfs[0]); });
         const auto deadline = butil::milliseconds_from_now(100);
         if (_pool->WaitWritable(bx, expected, &deadline) < 0 && errno == ETIMEDOUT) {
             ++timeouts;
@@ -1796,7 +1964,7 @@ TEST_F(UrmaPooledTest, shared_sq_wait_registration_races_credit_release) {
 }
 
 TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
-    while (_pool->AcquireJfs()) {}
+    FillCapacity();
     butil::atomic<int>* bx[3];
     std::thread writers[3];
     std::atomic<int> timeouts{0};
@@ -1828,8 +1996,8 @@ TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
     bthread::butex_wake_all(bx[1]);
     writers[1].join();
     bthread::butex_destroy(bx[1]);
-    _pool->ReleaseJfs(_pool->io_jfs[0]);
-    _pool->ReleaseJfs(_pool->io_jfs[0]);
+    ReleaseCredit(_pool->io_jfs[0]);
+    ReleaseCredit(_pool->io_jfs[0]);
     for (int i : {0, 2}) {
         writers[i].join();
         bthread::butex_destroy(bx[i]);
@@ -1840,7 +2008,7 @@ TEST_F(UrmaPooledTest, shared_sq_wait_cancellation_preserves_other_waiters) {
 }
 
 TEST_F(UrmaPooledTest, shared_sq_shutdown_notifies_registered_waiters) {
-    while (_pool->AcquireJfs()) {}
+    FillCapacity();
     auto* bx = bthread::butex_create_checked<butil::atomic<int>>();
     bx->store(0);
     std::atomic<int> result{-2};
@@ -1894,22 +2062,6 @@ TEST_F(UrmaPooledTest, shared_sq_shutdown_drains_returning_guards) {
     bthread::butex_destroy(bx);
 }
 
-TEST_F(UrmaPooledTest, concurrent_sq_reservations_do_not_exceed_depth) {
-    std::atomic<int> acquired{0};
-    std::vector<std::thread> threads;
-    for (int i = 0; i < 8; ++i) {
-        threads.emplace_back([&] {
-            while (_pool->AcquireJfs()) { acquired.fetch_add(1); }
-        });
-    }
-    for (auto& thread : threads) { thread.join(); }
-    EXPECT_EQ(32, acquired.load());
-    EXPECT_FALSE(_pool->IsWritable());
-    for (auto* slot : _pool->io_jfs) {
-        EXPECT_EQ(slot->sq_depth, slot->sq_inflight.load());
-        slot->sq_inflight.store(0);
-    }
-}
 
 TEST_F(UrmaPooledTest, shutdown_reclaims_unpolled_contexts) {
     auto* sender = Endpoint();

@@ -760,6 +760,12 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
     UrmaOperation active(&slot->operations);
     if (!active) { return; }
     if (slot->stopped.load()) { return; }
+    auto stop = [&] {
+        slot->stopped.store(true);
+        if (slot->type == UrmaIoSlot::JFS_SLOT) {
+            g_urma_pool->KickDrain(static_cast<UrmaJfsSlot*>(slot));
+        }
+    };
     auto drain = [&]() -> bool {
         while (!slot->stopped.load()) {
             urma_cr_t cr[32];
@@ -794,7 +800,7 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
         const int count = urma_wait_jfc(slot->jfce, 1, 0, &event);
         if (count < 0 && errno == EINTR) { continue; }
         if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            slot->stopped.store(true);
+            stop();
             return;
         }
         if (count > 0) {
@@ -802,7 +808,7 @@ void UrmaEndpoint::PollIoJfc(Socket* carrier) {
             uint32_t events = 1;
             urma_ack_jfc(&event, &events, 1);
             if (!ok || urma_rearm_jfc(slot->jfc, false) != URMA_SUCCESS || !drain()) {
-                slot->stopped.store(true);
+                stop();
                 return;
             }
             continue;

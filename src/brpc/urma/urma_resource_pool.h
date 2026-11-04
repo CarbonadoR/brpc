@@ -263,8 +263,6 @@ public:
     virtual ~UrmaResourcePool();
     virtual int Initialize(urma_context_t*, const EventAdapter&);
     virtual bool Shutdown();
-    virtual UrmaJfsSlot* AcquireJfs();
-    UrmaJfsSlot* AcquirePreferredJfs(uint32_t preferred);
     virtual uint32_t PickJfr();
     bool IsWritable(uint32_t preferred = 0) const;
     static uint32_t PreferredJfs(SocketId, size_t count);
@@ -273,11 +271,8 @@ public:
     // The KeepWrite stack owns the waiter; only the preferred JFS notifies it.
     int WaitWritable(butil::atomic<int>* butex, int expected,
                      const timespec* deadline, uint32_t preferred = 0);
-    // Every returned reservation, including post failures, may unblock peers.
-    void ReleaseJfs(UrmaJfsSlot* slot);
     virtual int PostSend(UrmaJfsSlot*, urma_jfs_wr_t*, TxCompletionCtx*,
                          urma_jfs_wr_t** bad = nullptr);
-    UrmaJfsSlot* SelectJfs(uint32_t preferred, bool affinity) const;
     int Enqueue(UrmaJfsSlot*, TxBatch*);
     void KickDrain(UrmaJfsSlot*);
     void CompleteSend(UrmaJfsSlot*, const urma_cr_t&);

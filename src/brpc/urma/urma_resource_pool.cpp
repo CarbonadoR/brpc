@@ -162,36 +162,6 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
     }
     return 0;
 }
-UrmaJfsSlot* UrmaResourcePool::AcquireJfs() {
-    if (io_jfs.empty()) { errno = ENODEV; return nullptr; }
-    const uint32_t start = jfs_rr_counter.fetch_add(1, std::memory_order_relaxed);
-    for (size_t i = 0; i < io_jfs.size(); ++i) {
-        UrmaJfsSlot* slot = io_jfs[(start + i) % io_jfs.size()];
-        if (slot->stopped.load()) { continue; }
-        uint32_t used = slot->sq_inflight.load(std::memory_order_relaxed);
-        while (used < slot->sq_depth) {
-            if (slot->sq_inflight.compare_exchange_weak(used, used + 1)) {
-                return slot;
-            }
-        }
-    }
-    errno = EAGAIN;
-    return nullptr;
-}
-UrmaJfsSlot* UrmaResourcePool::AcquirePreferredJfs(uint32_t preferred) {
-    if (io_jfs.empty()) { errno = ENODEV; return nullptr; }
-    // Prefer affinity, but preserve pool-wide backpressure/wakeup semantics.
-    for (size_t i = 0; i < io_jfs.size(); ++i) {
-        auto* slot = io_jfs[(preferred + i) % io_jfs.size()];
-        if (slot->stopped.load()) { continue; }
-        uint32_t n = slot->sq_inflight.load(std::memory_order_relaxed);
-        while (n < slot->sq_depth) {
-            if (slot->sq_inflight.compare_exchange_weak(n, n + 1)) return slot;
-        }
-    }
-    errno = EAGAIN;
-    return nullptr;
-}
 uint32_t UrmaResourcePool::PickJfr() {
     return jfr_rr_counter.fetch_add(1, std::memory_order_relaxed) % io_jfr.size();
 }
@@ -317,19 +287,6 @@ int UrmaResourcePool::WaitWritable(butil::atomic<int>* butex, int expected,
     }
     return bthread::butex_wait(butex, expected, deadline);
 }
-void UrmaResourcePool::ReleaseJfs(UrmaJfsSlot* slot) {
-    slot->sq_inflight.fetch_sub(1);
-    if (!slot->has_writers.load()) { return; }
-    BAIDU_SCOPED_LOCK(slot->writers_mutex);
-    WakeWritersLocked(slot);
-}
-UrmaJfsSlot* UrmaResourcePool::SelectJfs(uint32_t preferred, bool) const {
-    if (io_jfs.empty()) { errno = ENODEV; return nullptr; }
-    auto* slot = io_jfs[preferred % io_jfs.size()];
-    if (!slot->stopped.load() && slot->sq_inflight.load() < slot->sq_depth) { return slot; }
-    return PickBackup(preferred);
-}
-
 int UrmaResourcePool::PostSend(UrmaJfsSlot* slot, urma_jfs_wr_t* wr,
                                TxCompletionCtx*, urma_jfs_wr_t** bad) {
     urma_jfs_wr_t* first_bad = nullptr;
