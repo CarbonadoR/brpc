@@ -56,3 +56,7 @@ brpc_example_configure_target(urma_performance_server)
 
 target_link_libraries(urma_performance_client PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
 target_link_libraries(urma_performance_server PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(urma_connection_stress connection_stress.cpp ${PROTO_SRC} ${PROTO_HEADER})
+brpc_example_configure_target(urma_connection_stress)
+target_link_libraries(urma_connection_stress PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
