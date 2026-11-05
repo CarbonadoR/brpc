@@ -35,6 +35,12 @@ DEFINE_int32(urma_io_jfs_cnt, 48, "Number of process-wide IO JFS slots");
 DEFINE_int32(urma_io_jfr_cnt, 64, "Number of process-wide shared IO JFR slots");
 DEFINE_int32(urma_io_sq_depth, 128, "Depth of each pooled IO send queue");
 DEFINE_int32(urma_io_rx_depth, 512, "Depth of each shared IO receive queue");
+DEFINE_bool(urma_io_jfs_lock_free, false,
+            "Disable UMDK internal locking for pooled JFS; the queue owner serializes posts");
+DEFINE_bool(urma_io_jfr_lock_free, false,
+            "Disable UMDK internal locking for pooled JFR; each JFR has one reposting executor");
+DEFINE_bool(urma_io_jfc_lock_free, false,
+            "Disable UMDK internal locking for pooled JFC; each JFC has one polling executor");
 UrmaResourcePool* g_urma_pool = nullptr;
 TxCompletionCtx::~TxCompletionCtx() {
     if (!header_in_send_data) { FreeHeaderBuffer(header_buf); }
@@ -132,6 +138,7 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
         cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
         cfg.jfc = slot->jfc;
+    cfg.flag.bs.lock_free = FLAGS_urma_io_jfc_lock_free;
         slot->jfr = urma_create_jfr(context, &cfg);
         if (!slot->jfr) { return -1; }
         slot->jfr_id = slot->jfr->jfr_id.id;
@@ -153,6 +160,7 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
         cfg.trans_mode = URMA_TM_RM;
         cfg.priority = GetUrmaJettyPriority();
         cfg.max_sge = BRPC_URMA_SINGLE_SGE ? 1 : GetUrmaMaxSge();
+        cfg.flag.bs.lock_free = FLAGS_urma_io_jfr_lock_free;
         cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
         cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
         cfg.jfc = slot->jfc;
@@ -176,6 +184,7 @@ uint64_t RotateLeft(uint64_t value, unsigned bits) {
 }
 struct JfsRandom {
     JfsRandom() {
+        cfg.flag.bs.lock_free = FLAGS_urma_io_jfs_lock_free;
         static std::atomic<uint64_t> sequence{1};
         uint64_t seed = sequence.fetch_add(1, std::memory_order_relaxed) ^
             std::hash<std::thread::id>()(std::this_thread::get_id());
