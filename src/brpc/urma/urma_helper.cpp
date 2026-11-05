@@ -44,9 +44,9 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
-#include "brpc/urma/urma_bonding.h"
 #include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma/urma_memory_pool.h"
+#include "brpc/urma/urma_resource_pool.h"
 
 DECLARE_int32(task_group_ntags);
 
@@ -66,12 +66,12 @@ DEFINE_bool(urma_use_polling, false,
 DEFINE_int32(urma_poller_num, 1,
              "Number of poller bthreads per bthread tag (polling mode only)");
 DEFINE_bool(urma_disable_bthread, false,
-            "Run the message-processing callback inline (no bthread spawned)");
+            "Deprecated: shared URMA CQs dispatch messages to bthreads");
 
 DEFINE_int32(urma_sq_size, 128,
-             "Depth of the local send jetty (JFS). [16, 4096]");
+             "Deprecated: use urma_io_sq_depth for pooled JFS");
 DEFINE_int32(urma_rq_size, 128,
-             "Depth of the local recv jetty (JFR). [16, 4096]");
+             "Deprecated: use urma_io_rx_depth for pooled JFR");
 DEFINE_int32(urma_cqe_poll_once, 32,
              "Max completion entries polled per urma_poll_jfc call");
 DEFINE_bool(urma_recv_zerocopy, true,
@@ -89,8 +89,7 @@ DEFINE_int32(urma_bonding_mode, 0,
 DEFINE_int32(urma_bonding_level, 0,
              "Bonding level for bonding devices: 0=IODIE, 1=port.");
 DEFINE_int32(urma_prepared_jetty_cnt, 8,
-             "Requested number of pre-allocated Jetty+CQ sets for fast "
-             "connect; capped automatically according to RLIMIT_NOFILE");
+             "Deprecated: pooled URMA uses urma_io_jfs_cnt/urma_io_jfr_cnt");
 
 DEFINE_int32(urma_buffer_size, 8 * 1024,
              "Per-buffer size in the URMA buffer pool (bytes). "
@@ -164,65 +163,16 @@ union urma_tp_type_en TpTypeCapability(urma_tp_type_t tp_type) {
     return capability;
 }
 
-bool ConfigureBondingMode(const std::string& device_name) {
-    const char* context_device_name =
-        g_context != nullptr && g_context->dev != nullptr
-            ? g_context->dev->name
-            : nullptr;
-    g_is_bonding_device =
-        IsBondingDeviceName(device_name.c_str()) ||
-        IsBondingDeviceName(context_device_name);
-    if (!g_is_bonding_device) {
-        return true;
-    }
-
-#if BRPC_URMA_HAS_BONDING_EXT
-    if (FLAGS_urma_bonding_mode < 0 ||
-        FLAGS_urma_bonding_mode >= BONDP_BONDING_MODE_MAX ||
-        FLAGS_urma_bonding_level < 0 ||
-        FLAGS_urma_bonding_level >= BONDP_BONDING_LEVEL_MAX) {
-        LOG(ERROR) << "Invalid URMA bonding configuration: mode="
-                   << FLAGS_urma_bonding_mode
-                   << " level=" << FLAGS_urma_bonding_level;
-        errno = EINVAL;
-        return false;
-    }
-
-    bondp_set_bonding_mode_in_t bond_in{};
-    bond_in.bonding_mode =
-        static_cast<bondp_bonding_mode_t>(FLAGS_urma_bonding_mode);
-    bond_in.bonding_level =
-        static_cast<bondp_bonding_level_t>(FLAGS_urma_bonding_level);
-
-    urma_user_ctl_in_t ctl_in{};
-    ctl_in.addr = reinterpret_cast<uint64_t>(&bond_in);
-    ctl_in.len = static_cast<uint32_t>(sizeof(bond_in));
-    ctl_in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
-    urma_user_ctl_out_t ctl_out{};
-    const urma_status_t status = urma_user_ctl(g_context, &ctl_in, &ctl_out);
-    if (status != URMA_SUCCESS) {
-        LOG(ERROR) << "urma_user_ctl(SET_BONDING_MODE) failed: status="
-                   << status << " device=" << device_name
-                   << " mode=" << FLAGS_urma_bonding_mode
-                   << " level=" << FLAGS_urma_bonding_level
-                   << ". It must run before segment/JFC/JFR creation";
-        errno = status > 0 ? status : EIO;
-        return false;
-    }
-    return true;
-#else
-    LOG(ERROR) << "URMA bonding device " << device_name
-               << " requires provider header urma_ubagg.h";
-    errno = ENOTSUP;
-    return false;
-#endif
-}
 
 }  // namespace
 
 static void GlobalRelease() {
     g_urma_available.store(false, butil::memory_order_release);
     UrmaEndpoint::GlobalRelease();
+    if (g_urma_pool) {
+        LOG(ERROR) << "Keep registered memory/context because URMA queues could not stop";
+        return;
+    }
     if (!ReleaseUrmaMemoryPools()) {
         LOG(ERROR) << "Keep URMA context because registered memory is still in use";
         return;
@@ -258,10 +208,18 @@ static bool GlobalUrmaInitializeImpl() {
         g_urma_available.store(true, butil::memory_order_release);
         return true;
     }
-    if (FLAGS_urma_sq_size < 16 || FLAGS_urma_sq_size > 4096 ||
-        FLAGS_urma_rq_size < 16 || FLAGS_urma_rq_size > 4096 ||
-        FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_count <= 0 ||
-        FLAGS_urma_poller_num <= 0) {
+    const int64_t rx_slots = int64_t(FLAGS_urma_io_jfr_cnt) * FLAGS_urma_io_rx_depth;
+    const int64_t tx_slots = int64_t(FLAGS_urma_io_jfs_cnt) * FLAGS_urma_io_sq_depth;
+    const int64_t pool_bytes = int64_t(FLAGS_urma_buffer_size) * FLAGS_urma_buffer_count +
+                              int64_t(64) * FLAGS_urma_header_buf_count;
+    if (FLAGS_urma_io_jfs_cnt <= 0 || FLAGS_urma_io_jfr_cnt <= 0 ||
+        FLAGS_urma_io_sq_depth <= 0 || FLAGS_urma_io_rx_depth <= 0 ||
+        FLAGS_urma_io_sq_depth > 65535 || FLAGS_urma_io_rx_depth > 65535 ||
+        FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_size % 64 != 0 ||
+        FLAGS_urma_buffer_count <= rx_slots ||
+        FLAGS_urma_header_buf_count < rx_slots + tx_slots ||
+        FLAGS_urma_memory_pool_limit_mb <= 0 ||
+        pool_bytes > int64_t(FLAGS_urma_memory_pool_limit_mb) * 1024 * 1024) {
         LOG(ERROR) << "Invalid URMA queue, buffer, or poller configuration";
         errno = EINVAL;
         return false;
@@ -345,9 +303,17 @@ static bool GlobalUrmaInitializeImpl() {
         LOG(ERROR) << "Fail to urma_create_context";
         return false;
     }
-    // The bonding provider only accepts SET_BONDING_MODE while the context
-    // has no dependent resource. This must precede register_seg/JFC/JFR.
-    if (!ConfigureBondingMode(device_name)) {
+    g_is_bonding_device = IsBondingDeviceName(device_name.c_str()) ||
+        (g_context->dev && IsBondingDeviceName(g_context->dev->name));
+    if (g_is_bonding_device || FLAGS_urma_use_polling) {
+        LOG(ERROR) << "Pooled URMA currently requires a non-bonding device and event mode";
+        errno = ENOTSUP;
+        return false;
+    }
+    if (g_device_attr.dev_cap.max_jfr_sge < 2 ||
+        g_device_attr.dev_cap.max_jfs_sge < (BRPC_URMA_SINGLE_SGE ? 1u : 2u)) {
+        LOG(ERROR) << "Pooled URMA requires two SGEs for header and body";
+        errno = ENOTSUP;
         return false;
     }
     uint32_t device_max_sge = g_device_attr.dev_cap.max_jfs_sge;
@@ -366,6 +332,10 @@ static bool GlobalUrmaInitializeImpl() {
         } else {
             g_max_sge = FLAGS_urma_max_sge;
         }
+    }
+    if (g_max_sge < (BRPC_URMA_SINGLE_SGE ? 1 : 2)) {
+        errno = EINVAL;
+        return false;
     }
     g_recv_block_size =
         static_cast<size_t>(FLAGS_urma_buffer_size) -
