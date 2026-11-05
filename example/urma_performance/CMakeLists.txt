@@ -23,6 +23,11 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/BrpcExample.cmake)
 option(LINK_SO "Whether examples are linked dynamically" OFF)
 
 brpc_example_find_common_deps(DYNAMIC_LIB)
+option(WITH_TCMALLOC "Link tcmalloc" OFF)
+if(WITH_TCMALLOC)
+    find_library(TCMALLOC_LIB NAMES tcmalloc REQUIRED)
+    list(APPEND DYNAMIC_LIB ${TCMALLOC_LIB})
+endif()
 
 protobuf_generate_cpp(PROTO_SRC PROTO_HEADER test.proto)
 set(BRPC_EXAMPLE_WITH_URMA ON)
@@ -41,8 +46,7 @@ find_library(URMA_LIB NAMES urma
 if(URMA_LIB)
     list(APPEND DYNAMIC_LIB ${URMA_LIB})
 else()
-    message(STATUS
-        "liburma not found; using the URMA implementation linked into brpc")
+    message(FATAL_ERROR "URMA examples require liburma")
 endif()
 
 add_executable(urma_performance_client client.cpp ${PROTO_SRC} ${PROTO_HEADER})

@@ -16,6 +16,14 @@
 # under the License.
 
 find_package(Gperftools)
+if(WITH_TCMALLOC)
+    # brpc_common_config already requires libtcmalloc. Avoid loading a second
+    # allocator from libtcmalloc_and_profiler into the same test process.
+    set(GPERFTOOLS_LIBRARIES ${TCMALLOC_LIB})
+    if(GPERFTOOLS_PROFILER)
+        list(APPEND GPERFTOOLS_LIBRARIES ${GPERFTOOLS_PROFILER})
+    endif()
+endif()
 
 add_library(brpc_test_config INTERFACE)
 target_link_libraries(brpc_test_config INTERFACE brpc_common_config)

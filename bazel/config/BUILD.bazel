@@ -117,10 +117,10 @@ config_setting(
 )
 
 config_setting(
-    name = "brpc_with_urma_use_real",
+    name = "brpc_with_urma_single_sge",
     define_values = {
         "BRPC_WITH_URMA": "true",
-        "BRPC_URMA_USE_MOCK": "false",
+        "BRPC_URMA_SINGLE_SGE": "true",
     },
     visibility = ["//visibility:public"],
 )
