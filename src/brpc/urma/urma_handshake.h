@@ -32,12 +32,13 @@ class UrmaEndpoint;
 
 // Wire-format-agnostic view of a peer's hello message. Both v2 (binary) and
 // v3 (protobuf) translate the bytes on the wire into this struct. The endpoint
-// then uses ApplyRemoteHello to size its send/recv windows and to drive
-// urma_import_seg / urma_import_jetty.
+// then uses ApplyRemoteHello to retain routing and receive-size information for
+// urma_import_seg / urma_import_jfr.
 struct ParsedHello {
     uint32_t buffer_size = 0;      // peer recv buffer size in bytes (per WR)
-    uint32_t recv_buffer_cnt = 0;  // peer recv buffer count (RQ depth - 1)
-    uint32_t jetty_id = 0;         // peer jetty id
+    uint32_t recv_buffer_cnt = 0;  // peer shared JFR depth
+    uint64_t socket_id = UINT64_MAX; // full versioned receiver SocketId
+    uint32_t jfr_id = 0;         // peer shared JFR id
     uint8_t eid[16] = {0};          // peer EID (network order)
     uint32_t uasid = 0;             // peer uasid
     uint8_t tp_type = 0;            // urma_tp_type_t: URMA_RTP / URMA_CTP / URMA_UTP
@@ -50,32 +51,32 @@ struct ParsedHello {
     uint32_t seg_token_id = 0;      // segment token id
 };
 
-// Validate all values that influence resource import and queue/window sizing.
+// Validate all values that influence resource import and receive sizing.
 // Both v2 and v3 handshakes must pass this check before negotiation succeeds.
 bool ValidHello(const ParsedHello& hello);
 
 // v2 binary wire layout. The full on-wire packet is:
-//   [ "URMA" 4B ][ HelloMessage body 82B ]   => 86 bytes total.
-// (msg_len = 86 includes the magic prefix and the body, matching RDMA's
+//   [ "URMA" 4B ][ HelloMessage body 90B ]   => 94 bytes total.
+// (msg_len = 94 includes the magic prefix and the body, matching RDMA's
 // convention where msg_len covers the whole packet.)
 namespace v2_wire {
 
 constexpr size_t MAGIC_STR_LEN = 4;
-constexpr size_t HELLO_BODY_LEN = 82;
-constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 86
+constexpr size_t HELLO_BODY_LEN = 90;
+constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 94
 constexpr size_t HELLO_MSG_LEN_MIN = HELLO_PACKET_LEN;
 constexpr size_t HELLO_MSG_LEN_MAX = 4096;
 constexpr uint16_t HELLO_V2_VERSION = 2;
-constexpr uint16_t IMPL_V2_VERSION = 1;
+constexpr uint16_t IMPL_V2_VERSION = 2;
 
-// The serializable struct. Aligned so it can be reinterpreted as raw bytes.
+// Host representation; Serialize/Deserialize explicitly encode the wire bytes.
 struct HelloMessage {
     uint16_t msg_len;       // total packet length (incl. magic)
     uint16_t hello_ver;
     uint16_t impl_ver;
     uint32_t buffer_size;
     uint32_t recv_buffer_cnt;
-    uint32_t jetty_id;
+    uint32_t jfr_id;
     uint8_t eid[16];
     uint32_t uasid;
     uint8_t tp_type;
@@ -85,6 +86,7 @@ struct HelloMessage {
     uint64_t seg_va;
     uint64_t seg_len;
     uint32_t seg_token_id;
+    uint64_t socket_id;     // appended at body offset 82
 
     void Serialize(void* buf) const;   // host -> network order, write to buf
     void Deserialize(const void* buf);  // network -> host order, read from buf

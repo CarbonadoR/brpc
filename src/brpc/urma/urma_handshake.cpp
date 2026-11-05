@@ -44,7 +44,7 @@ DEFINE_int32(urma_client_handshake_version, 2,
 
 // ============================================================================
 // v2 binary HelloMessage.
-// On-wire layout (network byte order, tightly packed body of 82 bytes):
+// On-wire layout (network byte order, tightly packed body of 90 bytes):
 //
 //   offset  field            size
 //      0    msg_len          2B    (full packet length incl. magic)
@@ -52,7 +52,7 @@ DEFINE_int32(urma_client_handshake_version, 2,
 //      4    impl_ver         2B
 //      6    buffer_size      4B
 //     10    recv_buffer_cnt  4B
-//     14    jetty_id         4B
+//     14    jfr_id         4B
 //     18    eid             16B    (raw, no swap)
 //     34    uasid            4B
 //     38    tp_type          1B
@@ -62,9 +62,10 @@ DEFINE_int32(urma_client_handshake_version, 2,
 //     62    seg_va           8B
 //     70    seg_len          8B
 //     78    seg_token_id     4B
-//   total = 82 bytes body.
+//     82    socket_id        8B
+//   total = 90 bytes body.
 //
-// Full packet = magic "URMA" (4B) + body (82B) = 86 bytes.
+// Full packet = magic "URMA" (4B) + body (90B) = 94 bytes.
 // ============================================================================
 
 namespace v2_wire {
@@ -92,7 +93,7 @@ void HelloMessage::Serialize(void* buf) const {
     write16(impl_ver);
     write32(buffer_size);
     write32(recv_buffer_cnt);
-    write32(jetty_id);
+    write32(jfr_id);
     std::memcpy(p, eid, sizeof(eid));
     p += sizeof(eid);
     write32(uasid);
@@ -105,6 +106,7 @@ void HelloMessage::Serialize(void* buf) const {
     write64(seg_va);
     write64(seg_len);
     write32(seg_token_id);
+    write64(socket_id);
 }
 
 void HelloMessage::Deserialize(const void* buf) {
@@ -133,7 +135,7 @@ void HelloMessage::Deserialize(const void* buf) {
     impl_ver = read16();
     buffer_size = read32();
     recv_buffer_cnt = read32();
-    jetty_id = read32();
+    jfr_id = read32();
     std::memcpy(eid, p, sizeof(eid));
     p += sizeof(eid);
     uasid = read32();
@@ -145,6 +147,7 @@ void HelloMessage::Deserialize(const void* buf) {
     seg_va = read64();
     seg_len = read64();
     seg_token_id = read32();
+    socket_id = read64();
 }
 
 }  // namespace v2_wire
@@ -155,10 +158,9 @@ void HelloMessage::Deserialize(const void* buf) {
 
 namespace {
 
-constexpr uint32_t MIN_BUFFER_SIZE = 1024;
-// Three SQ entries are reserved for flow-control messages. The advertised
-// receive count must leave at least one data WR after those reservations.
-constexpr uint32_t MIN_BUFFER_CNT = 3;
+constexpr uint32_t MIN_BUFFER_SIZE = 1024 - sizeof(butil::IOBuf::Block);
+// Shared RQ depth; no per-connection credit protocol in this version.
+constexpr uint32_t MIN_BUFFER_CNT = 1;
 constexpr uint32_t MAX_BUFFER_CNT = 65535;
 constexpr uint32_t MAX_V3_PB_SIZE = 4096;
 
@@ -171,10 +173,10 @@ bool ValidHello(const ParsedHello& h) {
     if (h.recv_buffer_cnt < MIN_BUFFER_CNT || h.recv_buffer_cnt > MAX_BUFFER_CNT) {
         return false;
     }
-    if (h.jetty_id == 0) {
+    if (h.jfr_id == 0 || h.socket_id == INVALID_SOCKET_ID) {
         return false;
     }
-    if (h.tp_type > static_cast<uint8_t>(URMA_UTP)) {
+    if (h.tp_type != static_cast<uint8_t>(URMA_CTP)) {
         return false;
     }
     // The provider consumes the advertised VA/length as a single remote
@@ -194,9 +196,22 @@ bool ValidHello(const ParsedHello& h) {
 int ReadBodyAndNegotiate(UrmaEndpoint* ep, ParsedHello* out, bool* negotiated) {
     *negotiated = false;
     uint8_t body[v2_wire::HELLO_BODY_LEN];
-    if (ep->ReadFromFd(body, v2_wire::HELLO_BODY_LEN) < 0) {
+    // Inspect the fixed prefix before reading the extended body. Waiting for
+    // 90 bytes from an old 82-byte hello deadlocks both handshake peers.
+    if (ep->ReadFromFd(body, 6) < 0) { return -1; }
+    uint16_t length, version, implementation;
+    std::memcpy(&length, body, 2);
+    std::memcpy(&version, body + 2, 2);
+    std::memcpy(&implementation, body + 4, 2);
+    length = butil::NetToHost16(length);
+    if (length < v2_wire::HELLO_MSG_LEN_MIN ||
+        length > v2_wire::HELLO_MSG_LEN_MAX ||
+        butil::NetToHost16(version) != v2_wire::HELLO_V2_VERSION ||
+        butil::NetToHost16(implementation) != v2_wire::IMPL_V2_VERSION) {
+        errno = EPROTO;
         return -1;
     }
+    if (ep->ReadFromFd(body + 6, v2_wire::HELLO_BODY_LEN - 6) < 0) { return -1; }
     v2_wire::HelloMessage m;
     m.Deserialize(body);
     if (m.msg_len < v2_wire::HELLO_MSG_LEN_MIN ||
@@ -206,7 +221,8 @@ int ReadBodyAndNegotiate(UrmaEndpoint* ep, ParsedHello* out, bool* negotiated) {
     ParsedHello p;
     p.buffer_size = m.buffer_size;
     p.recv_buffer_cnt = m.recv_buffer_cnt;
-    p.jetty_id = m.jetty_id;
+    p.jfr_id = m.jfr_id;
+    p.socket_id = m.socket_id;
     std::memcpy(p.eid, m.eid, 16);
     p.uasid = m.uasid;
     p.tp_type = m.tp_type;
@@ -285,7 +301,7 @@ int UrmaHandshakeServerV2::SendLocalHello() {
         // the client's version check fails and it falls back to TCP.
         m.hello_ver = 0;
         m.impl_ver = 0;
-        m.jetty_id = 0;
+        m.jfr_id = 0;
         m.buffer_size = 0;
     }
     uint8_t packet[v2_wire::HELLO_PACKET_LEN];
@@ -328,7 +344,7 @@ int UrmaHandshakeServerV3::ReceiveAndParseRemoteHello(ParsedHello* out,
 int UrmaHandshakeServerV3::SendLocalHello() {
     UrmaHello msg;
     _ep->FillLocalHelloV3(&msg);
-    // v3 has no zero-out path; the client rejects jetty_id==0 via ValidHello.
+    // v3 has no zero-out path; the client rejects jfr_id==0 via ValidHello.
     return _ep->WriteHelloV3(msg);
 }
 

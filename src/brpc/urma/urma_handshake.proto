@@ -29,13 +29,13 @@ option java_outer_classname = "UrmaHandshakeProto";
 message UrmaHello {
     required uint32 buffer_size = 1;      // recv buffer size in bytes (per WR)
     required uint32 recv_buffer_cnt = 2;  // number of recv buffers posted
-    required uint32 jetty_id = 3;         // local jetty id
+    required uint32 jfr_id = 3;           // local shared JFR id
     required bytes eid = 4;               // 16-byte local EID (network order)
     required uint32 uasid = 5;            // local uasid
     required uint32 tp_type = 6;          // urma_tp_type_t
 
     // Flattened peer buffer-pool segment (urma_seg_t + token). The receiver
-    // calls urma_import_seg with these fields BEFORE urma_import_jetty, so
+    // calls urma_import_seg with these fields BEFORE urma_import_jfr, so
     // the kernel establishes the transport path (TP) routing for the remote
     // EID. Otherwise the first SEND is rejected by hardware with
     // URMA_CR_RNR_RETRY_CNT_EXC_ERR (status=10).
@@ -44,4 +44,6 @@ message UrmaHello {
     required uint64 seg_va = 9;          // segment virtual address
     required uint64 seg_len = 10;        // segment length in bytes
     required uint32 seg_token_id = 11;   // segment token id
+    optional uint64 socket_id = 12;      // full receiver SocketId (mandatory for pooling)
+    optional uint32 impl_version = 13;   // 2 = pooled JFS/JFR + 64B header
 }
