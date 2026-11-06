@@ -43,8 +43,33 @@ DEFINE_bool(urma_io_jfc_lock_free, false,
             "Disable UMDK internal locking for pooled JFC; each JFC has one polling executor");
 UrmaResourcePool* g_urma_pool = nullptr;
 TxCompletionCtx::~TxCompletionCtx() {
+    ClearResources();
+}
+void TxCompletionCtx::ClearResources() {
     if (!header_in_send_data) { FreeHeaderBuffer(header_buf); }
-    if (batch) { batch->Release(); }
+    header_buf = nullptr;
+    header_in_send_data = false;
+    send_data.clear();
+    connection.reset();
+    TxBatch* owner = batch;
+    batch = nullptr;
+    if (owner) { owner->Release(); }
+}
+void TxCompletionCtx::ResetForUse() {
+    ClearResources();
+    refs.store(1, std::memory_order_relaxed);
+    wr = urma_jfs_wr_t{};
+    sge->clear();
+    self_socket_id = INVALID_SOCKET_ID;
+    jfs_index = 0;
+    seq = 0;
+    type = MSG_SMALL;
+    body_bytes = 0;
+    registry_index = 0;
+}
+void TxCompletionCtx::Recycle() {
+    ResetForUse();
+    butil::return_object(this);
 }
 static UrmaResourcePoolFactory g_resource_factory = nullptr;
 bool SetUrmaResourcePoolFactory(UrmaResourcePoolFactory factory) {
@@ -113,6 +138,7 @@ int UrmaResourcePool::CreateCompletionQueue(
     urma_jfc_cfg_t cfg{};
     cfg.depth = depth;
     cfg.jfce = slot->jfce;
+    cfg.flag.bs.lock_free = FLAGS_urma_io_jfc_lock_free;
     slot->jfc = urma_create_jfc(context, &cfg);
     return slot->jfc ? 0 : -1;
 }
@@ -134,11 +160,11 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
         urma_jfr_cfg_t cfg{};
         cfg.depth = slot->rx_depth;
         cfg.trans_mode = URMA_TM_RM;
+        cfg.flag.bs.lock_free = FLAGS_urma_io_jfr_lock_free;
         cfg.max_sge = 2;
         cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
         cfg.jfc = slot->jfc;
-    cfg.flag.bs.lock_free = FLAGS_urma_io_jfc_lock_free;
         slot->jfr = urma_create_jfr(context, &cfg);
         if (!slot->jfr) { return -1; }
         slot->jfr_id = slot->jfr->jfr_id.id;
@@ -158,9 +184,9 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
         urma_jfs_cfg_t cfg{};
         cfg.depth = slot->sq_depth;
         cfg.trans_mode = URMA_TM_RM;
+        cfg.flag.bs.lock_free = FLAGS_urma_io_jfs_lock_free;
         cfg.priority = GetUrmaJettyPriority();
         cfg.max_sge = BRPC_URMA_SINGLE_SGE ? 1 : GetUrmaMaxSge();
-        cfg.flag.bs.lock_free = FLAGS_urma_io_jfr_lock_free;
         cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
         cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
         cfg.jfc = slot->jfc;
@@ -184,7 +210,6 @@ uint64_t RotateLeft(uint64_t value, unsigned bits) {
 }
 struct JfsRandom {
     JfsRandom() {
-        cfg.flag.bs.lock_free = FLAGS_urma_io_jfs_lock_free;
         static std::atomic<uint64_t> sequence{1};
         uint64_t seed = sequence.fetch_add(1, std::memory_order_relaxed) ^
             std::hash<std::thread::id>()(std::this_thread::get_id());

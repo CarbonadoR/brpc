@@ -29,6 +29,7 @@
 #include <vector>
 #include "brpc/socket.h"
 #include "brpc/urma/urma_memory_pool.h"
+#include "butil/object_pool.h"
 #include "butil/synchronization/lock.h"
 #include "butil/containers/stack_container.h"
 #include "urma_api.h"
@@ -90,8 +91,11 @@ struct TxCompletionCtx {
     // A second reference, armed before post, belongs to the expected CQE.
     void AddRef() { refs.fetch_add(1, std::memory_order_relaxed); }
     void Release() {
-        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete this; }
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { Recycle(); }
     }
+    void ResetForUse();
+    void Recycle();
+    void ClearResources();
     std::atomic<uint32_t> refs{1};
     urma_jfs_wr_t wr{};
     butil::StackVector<urma_sge_t, 16> sge;
@@ -116,7 +120,19 @@ struct TxBatch {
     static TxBatch* Unlinked() { return reinterpret_cast<TxBatch*>(uintptr_t(-1)); }
     void AddRef() { refs.fetch_add(1, std::memory_order_relaxed); }
     void Release() {
-        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete this; }
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            next.store(Unlinked(), std::memory_order_relaxed);
+            items.fill(nullptr);
+            begin = count = 0;
+            refs.store(1, std::memory_order_relaxed);
+            butil::return_object(this);
+        }
+    }
+    void ResetForUse() {
+        next.store(Unlinked(), std::memory_order_relaxed);
+        refs.store(1, std::memory_order_relaxed);
+        items.fill(nullptr);
+        begin = count = 0;
     }
     void Append(TxCompletionCtx* ctx) {
         ctx->batch = this;

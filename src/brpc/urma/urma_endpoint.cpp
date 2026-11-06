@@ -482,11 +482,21 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         if (slot->stopped.load() || used >= slot->sq_depth) { errno = EAGAIN; continue; }
         const size_t budget = std::min<size_t>(URMA_TX_BATCH_MAX, slot->sq_depth - used);
         auto discard = [](TxBatch* node) { if (node) { node->DiscardPrepared(); } };
-        std::unique_ptr<TxBatch, decltype(discard)> batch(new TxBatch, discard);
+        TxBatch* pooled_batch = butil::get_object<TxBatch>();
+        if (!pooled_batch) { errno = ENOMEM; break; }
+        pooled_batch->ResetForUse();
+        std::unique_ptr<TxBatch, decltype(discard)> batch(pooled_batch, discard);
         size_t bytes = 0;
         int prepare_error = 0;
         while (!remaining.empty() && batch->count < budget) {
-            std::unique_ptr<TxCompletionCtx> ctx(new TxCompletionCtx);
+            auto recycle_ctx = [](TxCompletionCtx* value) {
+                if (value) { value->Release(); }
+            };
+            TxCompletionCtx* pooled_ctx = butil::get_object<TxCompletionCtx>();
+            if (!pooled_ctx) { prepare_error = ENOMEM; break; }
+            pooled_ctx->ResetForUse();
+            std::unique_ptr<TxCompletionCtx, decltype(recycle_ctx)> ctx(
+                pooled_ctx, recycle_ctx);
             ctx->self_socket_id = _self_socket_id;
             ctx->jfs_index = slot->index;
             ctx->connection = _conn_res;
