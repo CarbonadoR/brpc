@@ -473,6 +473,8 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     butil::IOBuf remaining;
     for (size_t j = 0; j < ndata; ++j) { remaining.append(*from[j]); }
     if (remaining.empty()) { return 0; }
+    const size_t max_wr_per_post = std::min<size_t>(
+        std::max(1, FLAGS_urma_io_tx_batch_max), URMA_TX_BATCH_MAX);
     size_t total_bytes = 0;
     for (int route = 0; route < 2; ++route) {
         auto* slot = route == 0 ? g_urma_pool->io_jfs[start % g_urma_pool->io_jfs.size()]
@@ -480,7 +482,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         if (!slot) { break; }
         const uint32_t used = slot->sq_inflight.load(std::memory_order_relaxed);
         if (slot->stopped.load() || used >= slot->sq_depth) { errno = EAGAIN; continue; }
-        const size_t budget = std::min<size_t>(URMA_TX_BATCH_MAX, slot->sq_depth - used);
+        const size_t budget = std::min<size_t>(max_wr_per_post, slot->sq_depth - used);
         auto discard = [](TxBatch* node) { if (node) { node->DiscardPrepared(); } };
         TxBatch* pooled_batch = butil::get_object<TxBatch>();
         if (!pooled_batch) { errno = ENOMEM; break; }
@@ -579,7 +581,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         total_bytes += bytes;
         _next_send_seq = static_cast<uint16_t>(_next_send_seq + accepted);
         // Bound preparation and keep a batch on the preferred JFS while it has room.
-        if (remaining.empty() || budget == URMA_TX_BATCH_MAX || prepare_error) { break; }
+        if (remaining.empty() || accepted == max_wr_per_post || prepare_error) { break; }
     }
     if (!total_bytes) { return -1; }
     size_t left = total_bytes;

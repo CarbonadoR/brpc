@@ -45,6 +45,7 @@ DECLARE_int32(urma_io_jfs_cnt);
 DECLARE_int32(urma_io_jfr_cnt);
 DECLARE_int32(urma_io_sq_depth);
 DECLARE_int32(urma_io_rx_depth);
+DECLARE_int32(urma_io_tx_batch_max);
 DECLARE_int32(urma_header_buf_count);
 
 // Fixed 64-byte wire header. Multi-byte fields use network byte order.
@@ -115,6 +116,8 @@ struct TxCompletionCtx {
     ~TxCompletionCtx();
 };
 
+// Compile-time storage capacity; the runtime maximum is configurable up to
+// this bound because TxBatch and the JFS owner's WR array are fixed-size.
 constexpr size_t URMA_TX_BATCH_MAX = 32;
 struct TxBatch {
     static TxBatch* Unlinked() { return reinterpret_cast<TxBatch*>(uintptr_t(-1)); }

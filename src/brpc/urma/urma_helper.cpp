@@ -214,13 +214,15 @@ static bool GlobalUrmaInitializeImpl() {
                               int64_t(64) * FLAGS_urma_header_buf_count;
     if (FLAGS_urma_io_jfs_cnt <= 0 || FLAGS_urma_io_jfr_cnt <= 0 ||
         FLAGS_urma_io_sq_depth <= 0 || FLAGS_urma_io_rx_depth <= 0 ||
+        FLAGS_urma_io_tx_batch_max <= 0 ||
+        FLAGS_urma_io_tx_batch_max > static_cast<int>(URMA_TX_BATCH_MAX) ||
         FLAGS_urma_io_sq_depth > 65535 || FLAGS_urma_io_rx_depth > 65535 ||
         FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_size % 64 != 0 ||
         FLAGS_urma_buffer_count <= rx_slots ||
         FLAGS_urma_header_buf_count < rx_slots + tx_slots ||
         FLAGS_urma_memory_pool_limit_mb <= 0 ||
         pool_bytes > int64_t(FLAGS_urma_memory_pool_limit_mb) * 1024 * 1024) {
-        LOG(ERROR) << "Invalid URMA queue, buffer, or poller configuration";
+        LOG(ERROR) << "Invalid URMA queue, TX batch, buffer, or poller configuration";
         errno = EINVAL;
         return false;
     }

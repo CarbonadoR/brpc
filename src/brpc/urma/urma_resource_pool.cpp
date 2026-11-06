@@ -35,6 +35,8 @@ DEFINE_int32(urma_io_jfs_cnt, 48, "Number of process-wide IO JFS slots");
 DEFINE_int32(urma_io_jfr_cnt, 64, "Number of process-wide shared IO JFR slots");
 DEFINE_int32(urma_io_sq_depth, 128, "Depth of each pooled IO send queue");
 DEFINE_int32(urma_io_rx_depth, 512, "Depth of each shared IO receive queue");
+DEFINE_int32(urma_io_tx_batch_max, 32,
+             "Maximum linked WRs in one pooled JFS post (valid range: 1-32)");
 DEFINE_bool(urma_io_jfs_lock_free, false,
             "Disable UMDK internal locking for pooled JFS; the queue owner serializes posts");
 DEFINE_bool(urma_io_jfr_lock_free, false,
@@ -147,6 +149,8 @@ int UrmaResourcePool::Initialize(urma_context_t* context,
     if (!context || !io_jfs.empty() || !io_jfr.empty() ||
         FLAGS_urma_io_jfs_cnt <= 0 || FLAGS_urma_io_jfr_cnt <= 0 ||
         FLAGS_urma_io_sq_depth <= 0 || FLAGS_urma_io_rx_depth <= 0 ||
+        FLAGS_urma_io_tx_batch_max <= 0 ||
+        FLAGS_urma_io_tx_batch_max > static_cast<int>(URMA_TX_BATCH_MAX) ||
         FLAGS_urma_io_sq_depth > 65535 || FLAGS_urma_io_rx_depth > 65535) {
         errno = EINVAL;
         return -1;
@@ -405,7 +409,9 @@ void UrmaResourcePool::DrainSendQueue(UrmaJfsSlot* slot) {
         if (used >= slot->sq_depth) { return; }
         // Include already-published nodes without waiting for a fuller batch.
         CollectIncoming(slot);
-        const size_t limit = std::min<size_t>(URMA_TX_BATCH_MAX, slot->sq_depth - used);
+        const size_t max_wr_per_post = std::min<size_t>(
+            std::max(1, FLAGS_urma_io_tx_batch_max), URMA_TX_BATCH_MAX);
+        const size_t limit = std::min<size_t>(max_wr_per_post, slot->sq_depth - used);
         TxCompletionCtx* entries[URMA_TX_BATCH_MAX];
         size_t count = 0;
         for (TxBatch* node = slot->pending_head; node && count < limit;
