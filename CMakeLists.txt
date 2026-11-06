@@ -27,9 +27,8 @@ option(WITH_BTHREAD_TRACER "With bthread tracer supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
 option(WITH_URMA "With URMA (openEuler Unified Remote Memory Access)" OFF)
-set(URMA_USE_MOCK "AUTO" CACHE STRING
-    "URMA mock mode: AUTO, ON, or OFF (OFF requires liburma)")
-set_property(CACHE URMA_USE_MOCK PROPERTY STRINGS AUTO ON OFF)
+option(URMA_SINGLE_SGE "Copy the URMA header and body into one send SGE" OFF)
+option(WITH_TCMALLOC "Link tcmalloc" OFF)
 option(DOWNLOAD_URMA_HEADERS
        "Download UMDK headers when WITH_URMA is enabled and headers are absent"
        ON)
@@ -131,13 +130,6 @@ if(WITH_URMA)
     set(WITH_URMA_VAL "1")
 endif()
 
-string(TOUPPER "${URMA_USE_MOCK}" URMA_USE_MOCK_MODE)
-if(NOT URMA_USE_MOCK_MODE STREQUAL "AUTO" AND
-   NOT URMA_USE_MOCK_MODE STREQUAL "ON" AND
-   NOT URMA_USE_MOCK_MODE STREQUAL "OFF")
-    message(FATAL_ERROR
-        "URMA_USE_MOCK must be AUTO, ON, or OFF, got: ${URMA_USE_MOCK}")
-endif()
 
 set(WITH_UBRING_VAL "0")
 if(WITH_UBRING)
@@ -187,11 +179,27 @@ list(APPEND BRPC_COMMON_DEFINITIONS
     __const__=__unused__
     _GNU_SOURCE
     USE_SYMBOLIZE
-    NO_TCMALLOC
     __STDC_FORMAT_MACROS
     __STDC_LIMIT_MACROS
     __STDC_CONSTANT_MACROS
 )
+
+if(WITH_TCMALLOC)
+    find_path(TCMALLOC_INCLUDE_PATH NAMES gperftools/tcmalloc.h)
+    find_library(TCMALLOC_LIB NAMES tcmalloc)
+    if(NOT TCMALLOC_INCLUDE_PATH OR NOT TCMALLOC_LIB)
+        message(FATAL_ERROR "WITH_TCMALLOC requires gperftools headers and libtcmalloc")
+    endif()
+    if(WITH_ASAN)
+        message(FATAL_ERROR "tcmalloc and AddressSanitizer cannot be enabled together")
+    endif()
+    list(APPEND BRPC_COMMON_INCLUDE_DIRS ${TCMALLOC_INCLUDE_PATH})
+else()
+    list(APPEND BRPC_COMMON_DEFINITIONS NO_TCMALLOC)
+endif()
+if(URMA_SINGLE_SGE)
+    list(APPEND BRPC_COMMON_DEFINITIONS BRPC_URMA_SINGLE_SGE=1)
+endif()
 
 if(WITH_ASAN)
     list(APPEND BRPC_COMMON_COMPILE_OPTIONS -fsanitize=address)
@@ -335,9 +343,7 @@ if(WITH_RDMA)
 endif()
 
 if(WITH_URMA)
-    # UrmaTransport and its link-time mock both compile against the upstream
-    # UMDK API. Prefer installed headers; otherwise fetch a pinned upstream
-    # commit, following Mooncake's URMA mock setup.
+    # Compile against the UMDK API headers.
     find_path(URMA_INCLUDE_PATH NAMES urma_api.h
               HINTS ENV URMA_ROOT
               PATHS /usr/include /usr/local/include
@@ -377,23 +383,8 @@ if(WITH_URMA)
     find_library(URMA_LIB NAMES urma
                  HINTS ENV URMA_ROOT
                  PATH_SUFFIXES lib lib64)
-    if(URMA_USE_MOCK_MODE STREQUAL "ON")
-        message(STATUS "URMA_USE_MOCK=ON; forcing the link-time URMA mock")
-        set(URMA_USE_MOCK_ENABLED 1)
-    elseif(URMA_USE_MOCK_MODE STREQUAL "OFF")
-        if(NOT URMA_LIB)
-            message(FATAL_ERROR
-                "URMA_USE_MOCK=OFF requires liburma; install it or use AUTO/ON.")
-        endif()
-        message(STATUS "URMA_USE_MOCK=OFF; using liburma")
-        set(URMA_USE_MOCK_ENABLED 0)
-    elseif(URMA_LIB)
-        message(STATUS "Found URMA library: ${URMA_LIB}")
-        set(URMA_USE_MOCK_ENABLED 0)
-    else()
-        message(STATUS
-            "liburma not found; building with the URMA link-time mock")
-        set(URMA_USE_MOCK_ENABLED 1)
+    if(NOT URMA_LIB)
+        message(FATAL_ERROR "WITH_URMA requires liburma")
     endif()
 endif()
 
@@ -456,10 +447,8 @@ if(WITH_RDMA)
 endif()
 
 if(WITH_URMA)
-    message(STATUS "brpc compile with URMA (mock=${URMA_USE_MOCK_ENABLED})")
-    if(NOT URMA_USE_MOCK_ENABLED)
-        list(APPEND DYNAMIC_LIB ${URMA_LIB})
-    endif()
+    message(STATUS "brpc compile with URMA")
+    list(APPEND DYNAMIC_LIB ${URMA_LIB})
 endif()
 
 if(WITH_UBRING)
@@ -468,6 +457,9 @@ if(WITH_UBRING)
 endif()
 
 set(BRPC_PRIVATE_LIBS "-lgflags -lprotobuf -lleveldb -lprotoc -lssl -lcrypto -ldl -lz")
+if(WITH_TCMALLOC)
+    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -ltcmalloc")
+endif()
 
 if(WITH_GLOG)
     set(DYNAMIC_LIB ${GLOG_LIB} ${DYNAMIC_LIB})
@@ -508,6 +500,9 @@ endif()
 list(REMOVE_DUPLICATES BRPC_COMMON_INCLUDE_DIRS)
 
 add_library(brpc_common_config INTERFACE)
+if(WITH_TCMALLOC)
+    target_link_libraries(brpc_common_config INTERFACE ${TCMALLOC_LIB})
+endif()
 # Generated protobuf headers live in the build directory. Search it before src/
 # so leftover in-source *.pb.h (gitignored, produced by Make) cannot shadow
 # updated .proto files such as errno.proto.
@@ -671,13 +666,6 @@ file(GLOB_RECURSE BRPC_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc
 file(GLOB_RECURSE THRIFT_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/thrift*.cpp")
 file(GLOB_RECURSE EXCLUDE_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/event_dispatcher_*.cpp")
 
-# When building with the real liburma, exclude the link-time mock so its urma_*
-# symbols do not clash with the library. When liburma is absent, keep it so CI
-# can build and test UrmaTransport without URMA hardware.
-if(WITH_URMA AND NOT URMA_USE_MOCK_ENABLED)
-    list(REMOVE_ITEM BRPC_SOURCES
-         "${PROJECT_SOURCE_DIR}/src/brpc/urma/mock_urma.cpp")
-endif()
 
 if(WITH_THRIFT)
     message("brpc compile with thrift protocol")

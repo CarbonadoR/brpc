@@ -1,209 +1,162 @@
-# UrmaTransport: URMA-based Remote Memory RPC
+# URMA shared-queue transport
 
-UrmaTransport is a transport implementation that uses openEuler's
-[URMA](https://atomgit.com/openeuler/umdk) (Unified Remote Memory Access) SDK
-for remote-memory RPC. It is the Route B transport proposed in
-[#3217](https://github.com/apache/brpc/discussions/3217) and complements the
-OBMM-based UBRing transport (Route A, [#3226](https://github.com/apache/brpc/issues/3226))
-for large-packet / cross-node scenarios (Route C, "double backend").
+UrmaTransport carries brpc messages through the URMA API in openEuler
+[UMDK](https://atomgit.com/openeuler/umdk). The data path uses reliable message
+mode (`URMA_TM_RM`), CTP, and separate JFS/JFR objects shared by logical connections.
 
-## Technical Background
+## Resource organization
 
-URMA exposes a verbs-style API over devices supported by UMDK. This
-implementation creates a reliable-message (`URMA_TM_RM`) Jetty with a CTP
-transport path, posts send work requests with `urma_post_jetty_send_wr`, and
-posts receive work requests with `urma_post_jfr_wr`. Completions are consumed
-from a JFC either by busy polling or through a JFCE event fd.
+`UrmaMemoryPool` owns registered storage, `UrmaResourcePool` owns queues and their
+lifecycle, and `UrmaEndpoint` maintains connection state, fragmentation, reordering
+and delivery. Memory and resource pool factories and an event adapter separate
+these responsibilities.
 
-## Build Configuration
+The process creates 48 JFS send queues and 64 JFR receive queues by default. Each
+slot has its own JFC, JFCE and event-carrier Socket. Logical connections retain a
+local JFR assignment, peer resource references, versioned SocketIds, sequence
+numbers and reorder state rather than allocating dedicated hardware queues.
 
-### Build with CMake
+Imported peer JFRs are cached by EID, UASID and JFR ID with reference counting.
+Outstanding sends retain the connection resources even after the endpoint closes.
 
-```bash
-# Build brpc with URMA support
-cmake -B build -DWITH_URMA=ON
-make -C build -j$(nproc)
+## Registered memory
 
-# Build the urma_performance example
-cd example/urma_performance
-cmake -B build
-make -C build -j$(nproc)
-```
+The default allocator registers an mmap region and serves fixed-size blocks from
+64 independently locked free lists. Allocation starts at a thread-selected shard
+and searches other shards when necessary. Data blocks default to 8KiB, including
+the IOBuf block header. A separate pool supplies raw 64B wire headers without
+routing them through the IOBuf block allocator.
 
-`WITH_URMA=ON` compiles against upstream UMDK headers. CMake prefers an
-installed SDK and, following Mooncake's mock setup, downloads UMDK at a pinned
-commit when the headers are unavailable. Set `DOWNLOAD_URMA_HEADERS=OFF` to
-disable downloading.
-When `liburma` is found it is linked for the hardware data path. Otherwise,
-brpc uses its link-time mock so URMA code and tests can still be built without
-hardware. `URMA_USE_MOCK` defaults to `AUTO`; set it to `ON` to force the mock,
-or to `OFF` to require `liburma` and exclude the mock.
+Pools do not automatically grow after initialization. Exhaustion returns failure.
+DMA must finish before unregistration. Live IOBuf references require retaining
+the mapping and deallocator even if the data segment has already been unregistered.
 
-### Build with Make
+`UrmaMemoryPool` exposes allocation, deallocation, address ownership, segment
+lookup and unregistration. Before global initialization, applications can replace
+the allocator through `SetUrmaMemoryPoolFactory`; global initialization then
+creates and installs both pools. Replacements must preserve registration and
+lifetime guarantees. User storage is managed through `RegisterMemoryForUrma` and
+`DeregisterMemoryForUrma`; it must remain registered while sends reference it.
 
-```bash
-sh config_brpc.sh --headers=/usr/include --libs=/usr/lib \
-    --with-urma
-make -j4
+## Connection establishment
 
-# Force the mock, or require the real liburma
-sh config_brpc.sh --headers=/usr/include --libs=/usr/lib \
-    --with-urma --with-urma-mock
-sh config_brpc.sh --headers=/usr/include --libs=/usr/lib \
-    --with-urma --without-urma-mock
-```
+A connection negotiates over TCP before switching to URMA. The handshake carries
+receive capacity, queue information, the versioned SocketId, EID/UASID, transport
+path type and segment metadata. Binary v2 and Protobuf v3 encodings are supported;
+the client defaults to v2. The shared-queue protocol requires implementation
+version 2 and validates the peer resource fields and address range.
 
-Without either override, the Make configuration selects the implementation
-automatically from whether `liburma` is available. `--without-urma-mock`
-requires `liburma` in the configured library paths.
+`URMA_ON` is published only after negotiation and resource import complete.
+Legacy handshakes without the shared-queue fields cannot establish a pooled
+connection. Peers without URMA support follow the existing negotiation failure
+and TCP fallback path. Concurrent connections use separate handshake objects so
+pending callbacks are not shared.
 
-### Build with Bazel
+## Sending
 
-```bash
-# Build brpc with URMA support
-bazel build --define=BRPC_WITH_URMA=true //:brpc
+Every SEND fragment carries a 64B header containing the destination SocketId,
+a 16-bit sequence number and a message type. Multi-byte fields use network byte
+order. CTP limits the complete message to 4096B, leaving at most 4032B for the
+body, further constrained by both peers' receive capacity.
 
-# This only shows the download switch; headers must still be declared by the toolchain or a local BUILD target
-bazel build --define=BRPC_WITH_URMA=true \
-    --define=BRPC_DOWNLOAD_URMA_HEADERS=false //:brpc
+The default mode uses one header SGE and one or more body SGEs. Gathering crosses
+input IOBufs and backing blocks until the total SGE limit or body limit is reached.
+Registered body storage is referenced directly; the entire payload is not copied
+just to combine fragments. Unregistered fragments cannot be used directly as DMA
+sources.
 
-# Build and run the URMA unit tests (using the mock, without URMA hardware)
-bazel test --define=BRPC_WITH_URMA=true \
-    --define=BRPC_URMA_USE_MOCK=true //test:brpc_unittests
+With `URMA_SINGLE_SGE`, the sender constructs the header in a registered data block
+and copies the body immediately after it, submitting one SGE. Input fragmentation
+does not consume additional SGEs. Both modes use the same wire format; receiving
+always uses separate header and body SGEs.
 
-# Use the real liburma; the linker must be able to find -lurma
-bazel build --define=BRPC_WITH_URMA=true \
-    --define=BRPC_URMA_USE_MOCK=false //:brpc
-```
+JFS affinity is enabled by default. A connection initially chooses its preferred
+JFS through round-robin assignment, reuses it when possible, and tries other
+shared queues when it is full. Each WR reserves an SQ slot. Failed submissions
+return it; successful submissions release it on TX completion. The implementation
+posts individual WRs rather than submitting WR chains.
 
-Bazel fetches the pinned UMDK commit and exposes its headers through
-`@umdk//:urma_headers` by default. With
-`BRPC_DOWNLOAD_URMA_HEADERS=false`, Bazel does not depend on that external
-repository; the actual build must still declare `urma_api.h`, `urma_types.h`,
-and `urma_ubagg.h` through the toolchain or a local BUILD target. Passing only
-`--copt=-I/path` to a directory outside the workspace does not make undeclared
-headers available inside Bazel's default sandbox.
-`BRPC_URMA_USE_MOCK=true` forces the link-time mock, while `false` excludes it
-and links `liburma`. If unspecified, URMA builds use the mock by default.
+A TX context retains the header, data and connection references until completion.
+Caller data is consumed only after a successful post. Writers waiting for shared
+SQ capacity register with the pool, so space released on any queue can notify
+them; registration, notification and shutdown races are coordinated.
 
-## Usage
+## Receiving and delivery
 
-Select the transport by setting `socket_mode` on the channel / server:
+Each JFR has preposted receive contexts. Completion processing validates the
+header and length, routes through the destination SocketId, and restores each
+connection's ordered byte stream. In-order fragments bypass the reorder map;
+out-of-order fragments remain buffered until the gap closes. Sequence arithmetic
+supports 16-bit wraparound. Duplicate or invalid fragments fail the connection.
 
-```cpp
-// Client
-brpc::ChannelOptions opt;
-opt.socket_mode = brpc::SOCKET_MODE_URMA;
-opt.protocol = "baidu_std";   // URMA supports baidu_std only
-brpc::Channel channel;
-channel.Init("127.0.0.1:8003", &opt);
+Reposting reuses the receive context and header. Delivered bodies remain alive
+through IOBuf references. The handoff uses movable ownership transfers to avoid
+extra shallow copies and reference bookkeeping; it does not copy payload bytes.
 
-// Server
-brpc::ServerOptions sopt;
-sopt.socket_mode = brpc::SOCKET_MODE_URMA;
-server.Start(port, &sopt);
-```
+By default, one CQ poll collects connections that need parsing and invokes the
+parser once for each after processing that group of completions. This combines
+parser invocations, preserving protocol message boundaries and per-connection
+byte order.
 
-If the peer does not speak URMA (e.g. a TCP-only client connecting to a
-URMA-enabled server), the transport transparently falls back to TCP after
-the 4-byte magic handshake. No application code change is required.
+Last-message handling defers at most one inline message across the delivery
+scope until CQ event ownership has been handed off and relevant locks released.
+Other messages use normal scheduling. Business callbacks therefore do not execute
+while holding a shared queue lock.
 
-## Architecture
+## Concurrency and shutdown
 
-UrmaTransport follows the same two-layer design as `RdmaTransport` and
-`UBShmTransport`:
+A slot mutex coordinates post, poll and teardown for that queue without
+serializing different slots. Pending context sets track unreclaimed work. The
+pool and event-carrier Socket both retain slot references, allowing queued event
+callbacks to outlive shutdown safely.
 
-```
-UrmaTransport : public Transport         (urma_transport.{h,cpp})
-  +-- std::shared_ptr<TcpTransport>      (fallback path)
-  +-- urma::UrmaEndpoint*                (URMA data path)
-  +-- UrmaState { URMA_ON, URMA_OFF, URMA_UNKNOWN }
+Shutdown stops event and queue activity, wakes waiting writers, and releases
+queues, completion contexts and imports in dependency order. Unregistration
+requires completed DMA; releasing storage additionally requires that application
+references no longer use it. Cleanup must not invalidate storage still accessed
+by the device or application.
 
-urma::UrmaEndpoint : public SocketUser   (urma/urma_endpoint.{h,cpp})
-  +-- UrmaResource { jfc, jfce, jfr, jetty, remote_jetty, remote_seg }
-  +-- handshake state machine (C/S symmetric, driven over the TCP fd)
-  +-- send path: urma_post_jetty_send_wr(URMA_OPC_SEND)
-  +-- recv path: urma_poll_jfc -> HandleCompletion -> InputMessenger
-  +-- two-window credit flow control
-      (_remote_rq_window_size / _sq_window_size)
-```
+## Building and enabling
 
-### Connection establishment (dual-plane)
+UMDK headers and `liburma` are required. CMake enables the module with
+`WITH_URMA=ON`, preferring installed SDK headers and optionally downloading a
+pinned UMDK revision when headers are absent. `DOWNLOAD_URMA_HEADERS=OFF` disables
+that download. SDK locations can be supplied through `URMA_ROOT`,
+`URMA_INCLUDE_PATH`, `URMA_BOND_INCLUDE_PATH` and `URMA_LIB`.
 
-Like RDMA / UBRing, the control plane is TCP and the data plane is URMA:
+Make uses `config_brpc.sh --with-urma` with dependency paths provided through
+`--headers` and `--libs`. Bazel uses `BRPC_WITH_URMA=true` and links `liburma`.
+Disabling `BRPC_DOWNLOAD_URMA_HEADERS` requires headers declared through the
+toolchain or a local dependency.
 
-1. TCP connect completes.
-2. `UrmaConnect::StartConnect` spawns the client handshake bthread.
-3. Both sides exchange a `UrmaHello` message (magic `URMA` for v2 binary,
-   `URM3` for v3 protobuf) over the TCP fd. The message carries the local
-   EID, jetty id, recv buffer count, and the flattened buffer-pool segment.
-4. Each side calls `urma_import_seg` **before** `urma_import_jetty` to
-   establish transport-path (TP) routing for the remote EID. Skipping the
-   `import_seg` step causes the first SEND to be rejected by hardware with
-   `URMA_CR_RNR_RETRY_CNT_EXC_ERR`.
-5. A 4-byte ACK (`HELLO_ACK_URMA_OK = 0x1`) confirms both sides want URMA.
-6. On success, the TCP fd is kept only for the epoll lifecycle and fallback;
-   payloads flow through URMA.
+CMake's `URMA_SINGLE_SGE` and Bazel's `BRPC_URMA_SINGLE_SGE` choose the send mode;
+both default to disabled. The setting must apply to the brpc library, not only
+the caller.
 
-### Memory management
+Enable transport through `ChannelOptions::use_urma` and `ServerOptions::use_urma`.
+The current implementation supports `baidu_std`, non-bonding devices and event
+mode. Busy polling, end-to-end credit/ACK flow control and one-sided READ/WRITE
+for large messages are not implemented. Larger payloads continue to use fragmented
+SEND operations.
 
-A single large region is `mmap`-ed and registered once with
-`urma_register_seg`, then sliced into fixed-size buffers (default 8 KB).
-`butil::iobuf::blockmem_allocate` is hijacked so every IOBuf block is backed
-by the registered segment, allowing the send path to build `urma_sge_t`
-directly from IOBuf block refs without per-message registration (mirroring the
-RDMA `block_pool` design). User-registered memory is supported via
-`urma::RegisterMemoryForUrma` / `DeregisterMemoryForUrma`.
+## Main runtime parameters
 
-## Configuration
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `urma_device` | empty | Device name; empty selects the first enumerated device |
+| `urma_io_jfs_cnt` | 48 | Process-wide send queue count |
+| `urma_io_jfr_cnt` | 64 | Process-wide receive queue count |
+| `urma_io_sq_depth` | 128 | In-flight slots per send queue |
+| `urma_io_rx_depth` | 512 | Preposted receives per receive queue |
+| `urma_buffer_size` | 8192 | Data block size including the IOBuf block header |
+| `urma_max_sge` | 0 | Device capability when zero; positive values cap send SGEs |
+| `urma_cqe_poll_once` | 32 | Maximum completions per poll |
+| `urma_jfs_affinity` | true | Prefer the connection's assigned JFS |
+| `urma_rx_batch_parse` | true | Combine parsing per connection within a poll |
+| `urma_inline_last` | true | Execute the deferred last message after event handoff |
+| `urma_client_handshake_version` | 2 | Client handshake encoding, 2 or 3 |
 
-All flags use the `urma_` prefix (mirroring RDMA's `rdma_` prefix):
-
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--urma_use_polling` | false | Busy-poll the JFC instead of event mode |
-| `--urma_poller_num` | 1 | Poller bthreads per bthread tag (polling mode) |
-| `--urma_disable_bthread` | false | Run message processing inline |
-| `--urma_sq_size` | 128 | Local JFS depth [16, 4096] |
-| `--urma_rq_size` | 128 | Local JFR depth [16, 4096] |
-| `--urma_cqe_poll_once` | 32 | Max CQEs per `urma_poll_jfc` |
-| `--urma_recv_zerocopy` | true | Zero-copy receives above `--urma_zerocopy_min_size` |
-| `--urma_zerocopy_min_size` | 512 | Receives smaller than this are copied |
-| `--urma_device` | "" | URMA device name (empty = first) |
-| `--urma_max_sge` | 0 | Max SGEs per WR (0 = device max) |
-| `--urma_bonding_mode` | 0 | Bonding mode: 0=standalone, 1=active-backup, 2=balance |
-| `--urma_bonding_level` | 0 | Bonding level: 0=IODIE, 1=port |
-| `--urma_prepared_jetty_cnt` | 8 | Requested pre-allocated Jetty+CQ sets; automatically capped according to `RLIMIT_NOFILE` |
-| `--urma_buffer_size` | 8192 | Per-buffer size in the pool (bytes) |
-| `--urma_buffer_count` | 65536 | Number of buffers in the pool |
-| `--urma_poller_yield` | false | Yield in the busy-poll loop |
-| `--urma_client_handshake_version` | 2 | Client wire version (2=binary, 3=protobuf) |
-
-For a device whose name starts with `bonding`, brpc configures the provider
-immediately after context creation and before creating segments or queues.
-The default standalone+IODIE combination matches the UMDK performance tool.
-Bonding support requires the provider extension header `urma_ubagg.h`.
-
-## Coexistence with UBRing
-
-UrmaTransport is the recommended transport for **large packets and
-cross-node** high-throughput paths, while UBRing (`SOCKET_MODE_UBRING`) is
-optimal for **small packets and same-node IPC** (sub-microsecond, zero
-syscalls). For a mixed workload, select the transport per service:
-
-| Scenario | Recommended `socket_mode` |
-|----------|---------------------------|
-| Same-host IPC | `SOCKET_MODE_UBRING` |
-| Cross-node small packets (< 64 KB) | `SOCKET_MODE_UBRING` (UBS-Mem) or `SOCKET_MODE_URMA` |
-| Cross-node large packets (>= 64 KB) | `SOCKET_MODE_URMA` |
-| Traditional RoCE / IB datacenter | `SOCKET_MODE_URMA` or `SOCKET_MODE_RDMA` |
-
-A single-connection hybrid that auto-routes by packet size (Route C, scheme B)
-is tracked as a future enhancement.
-
-## Limitations
-
-- `baidu_std` protocol only (same as RDMA). SSL, RTMP, NSHEAD, MONGO are
-  rejected at `ContextInitOrDie`.
-- A hardware data path requires a supported UMDK provider and `liburma`.
-- The current implementation targets Linux.
+Configure queue counts, depths and pool parameters before global initialization.
+Preposted receives require sufficient data blocks, and headers must cover receive
+and send slots. Initialization checks the combination; device capabilities also
+constrain queue depths, SGE counts and message size.

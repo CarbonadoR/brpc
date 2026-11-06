@@ -23,10 +23,14 @@ package test;
 
 message PerfTestRequest {
     required bool echo_attachment = 1;
+    optional bool query_connections = 2;
 }
 
 message PerfTestResponse {
     required string cpu_usage = 1;
+    // Used by the connection stress test to detect connection sharing/reconnects.
+    optional fixed64 verification_socket_id = 2;
+    optional uint64 active_connections = 3;
 }
 
 service PerfTestService {

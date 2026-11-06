@@ -44,8 +44,9 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
-#include "brpc/urma/urma_bonding.h"
 #include "brpc/urma/urma_endpoint.h"
+#include "brpc/urma/urma_memory_pool.h"
+#include "brpc/urma/urma_resource_pool.h"
 
 DECLARE_int32(task_group_ntags);
 
@@ -65,12 +66,12 @@ DEFINE_bool(urma_use_polling, false,
 DEFINE_int32(urma_poller_num, 1,
              "Number of poller bthreads per bthread tag (polling mode only)");
 DEFINE_bool(urma_disable_bthread, false,
-            "Run the message-processing callback inline (no bthread spawned)");
+            "Deprecated: shared URMA CQs dispatch messages to bthreads");
 
 DEFINE_int32(urma_sq_size, 128,
-             "Depth of the local send jetty (JFS). [16, 4096]");
+             "Deprecated: use urma_io_sq_depth for pooled JFS");
 DEFINE_int32(urma_rq_size, 128,
-             "Depth of the local recv jetty (JFR). [16, 4096]");
+             "Deprecated: use urma_io_rx_depth for pooled JFR");
 DEFINE_int32(urma_cqe_poll_once, 32,
              "Max completion entries polled per urma_poll_jfc call");
 DEFINE_bool(urma_recv_zerocopy, true,
@@ -88,14 +89,17 @@ DEFINE_int32(urma_bonding_mode, 0,
 DEFINE_int32(urma_bonding_level, 0,
              "Bonding level for bonding devices: 0=IODIE, 1=port.");
 DEFINE_int32(urma_prepared_jetty_cnt, 8,
-             "Requested number of pre-allocated Jetty+CQ sets for fast "
-             "connect; capped automatically according to RLIMIT_NOFILE");
+             "Deprecated: pooled URMA uses urma_io_jfs_cnt/urma_io_jfr_cnt");
 
 DEFINE_int32(urma_buffer_size, 8 * 1024,
              "Per-buffer size in the URMA buffer pool (bytes). "
              "Must match IOBuf block size to keep zero-copy working.");
-DEFINE_int32(urma_buffer_count, 65536,
+DEFINE_int32(urma_header_buf_count, 65536,
+             "Number of independently registered 64B URMA headers.");
+DEFINE_int32(urma_buffer_count, 48000,
              "Number of buffers in the URMA buffer pool.");
+DEFINE_int32(urma_memory_pool_limit_mb, 400,
+             "Maximum combined registered data and header pool bytes in MiB.");
 
 DEFINE_bool(urma_poller_yield, false,
             "Yield (bthread_yield) in the busy poll loop to let other "
@@ -128,14 +132,6 @@ static uint8_t g_jetty_priority = 6;
 // means another component owns that state.
 static bool g_owns_urma_init = false;
 
-// The single registered segment backing the buffer pool. The whole pool is
-// one urma_register_seg call, sliced into fixed-size buffers. urma_target_seg_t
-// is the per-buffer handle carried by urma_sge_t.tseg on the send/recv path.
-static urma_target_seg_t* g_pool_seg = nullptr;
-static void* g_pool_base = nullptr;
-static size_t g_pool_size = 0;
-static size_t g_pool_buffer_size = 0;
-
 // User-registered segments (RegisterMemoryForUrma). Keyed by buffer address.
 struct UserSeg {
     urma_target_seg_t* tseg = nullptr;
@@ -145,22 +141,7 @@ struct UserSeg {
 static butil::FlatMap<void*, UserSeg>* g_user_segs = nullptr;
 static butil::Mutex* g_user_segs_lock = nullptr;
 
-// Original IOBuf allocator (saved so we can restore it on release).
-static void* (*g_mem_alloc_orig)(size_t) = nullptr;
-static void (*g_mem_dealloc_orig)(void*) = nullptr;
-static size_t g_default_block_size_orig = 0;
-
 namespace {
-
-// Round up to the page size.
-size_t PageSize() {
-    long ps = sysconf(_SC_PAGESIZE);
-    return ps > 0 ? static_cast<size_t>(ps) : 4096;
-}
-
-size_t AlignUp(size_t v, size_t align) {
-    return (v + align - 1) / align * align;
-}
 
 bool IsBondingDeviceName(const char* name) {
     return name != nullptr && strncmp(name, "bonding", 7) == 0;
@@ -182,262 +163,20 @@ union urma_tp_type_en TpTypeCapability(urma_tp_type_t tp_type) {
     return capability;
 }
 
-bool ConfigureBondingMode(const std::string& device_name) {
-    const char* context_device_name =
-        g_context != nullptr && g_context->dev != nullptr
-            ? g_context->dev->name
-            : nullptr;
-    g_is_bonding_device =
-        IsBondingDeviceName(device_name.c_str()) ||
-        IsBondingDeviceName(context_device_name);
-    if (!g_is_bonding_device) {
-        return true;
-    }
-
-#if BRPC_URMA_HAS_BONDING_EXT
-    if (FLAGS_urma_bonding_mode < 0 ||
-        FLAGS_urma_bonding_mode >= BONDP_BONDING_MODE_MAX ||
-        FLAGS_urma_bonding_level < 0 ||
-        FLAGS_urma_bonding_level >= BONDP_BONDING_LEVEL_MAX) {
-        LOG(ERROR) << "Invalid URMA bonding configuration: mode="
-                   << FLAGS_urma_bonding_mode
-                   << " level=" << FLAGS_urma_bonding_level;
-        errno = EINVAL;
-        return false;
-    }
-
-    bondp_set_bonding_mode_in_t bond_in{};
-    bond_in.bonding_mode =
-        static_cast<bondp_bonding_mode_t>(FLAGS_urma_bonding_mode);
-    bond_in.bonding_level =
-        static_cast<bondp_bonding_level_t>(FLAGS_urma_bonding_level);
-
-    urma_user_ctl_in_t ctl_in{};
-    ctl_in.addr = reinterpret_cast<uint64_t>(&bond_in);
-    ctl_in.len = static_cast<uint32_t>(sizeof(bond_in));
-    ctl_in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
-    urma_user_ctl_out_t ctl_out{};
-    const urma_status_t status = urma_user_ctl(g_context, &ctl_in, &ctl_out);
-    if (status != URMA_SUCCESS) {
-        LOG(ERROR) << "urma_user_ctl(SET_BONDING_MODE) failed: status="
-                   << status << " device=" << device_name
-                   << " mode=" << FLAGS_urma_bonding_mode
-                   << " level=" << FLAGS_urma_bonding_level
-                   << ". It must run before segment/JFC/JFR creation";
-        errno = status > 0 ? status : EIO;
-        return false;
-    }
-    return true;
-#else
-    LOG(ERROR) << "URMA bonding device " << device_name
-               << " requires provider header urma_ubagg.h";
-    errno = ENOTSUP;
-    return false;
-#endif
-}
 
 }  // namespace
-
-// ============================================================================
-// Buffer pool: one registered segment, sliced into fixed-size buffers.
-// ============================================================================
-
-namespace {
-
-// Shard the free list to reduce contention between allocator threads.
-constexpr size_t kShardCount = 64;
-struct BufferPool {
-    butil::Mutex mutexes[kShardCount];
-    std::vector<void*> free_lists[kShardCount];
-    std::vector<char> in_use;  // 0/1 per buffer
-    butil::atomic<size_t> outstanding{0};
-
-    size_t buffer_count() const {
-        return in_use.size();
-    }
-};
-BufferPool* g_pool = nullptr;
-
-size_t ShardFor(void* buf) {
-    auto* base = static_cast<char*>(buf);
-    auto offset = static_cast<size_t>(base - static_cast<char*>(g_pool_base));
-    auto idx = offset / g_pool_buffer_size;
-    return idx % kShardCount;
-}
-
-size_t PreferredShard() {
-    // pthread_t is an integer on Linux and a pointer on macOS. Hash its native
-    // representation instead of assuming either form with a cast.
-    return std::hash<pthread_t>()(pthread_self()) % kShardCount;
-}
-
-void* PoolAllocate(size_t size) {
-    if (BAIDU_UNLIKELY(g_skip_urma_init)) {
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
-    // Only serve the configured buffer size; callers always ask for that.
-    if (size > g_pool_buffer_size) {
-        // Larger than a single buffer -- fall back to the system allocator.
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
-    auto start = PreferredShard();
-    for (size_t i = 0; i < kShardCount; ++i) {
-        auto shard = (start + i) % kShardCount;
-        BAIDU_SCOPED_LOCK(g_pool->mutexes[shard]);
-        auto& fl = g_pool->free_lists[shard];
-        if (fl.empty()) {
-            continue;
-        }
-        void* buf = fl.back();
-        fl.pop_back();
-        auto idx = (static_cast<char*>(buf) -
-                    static_cast<char*>(g_pool_base)) / g_pool_buffer_size;
-        if (idx < g_pool->in_use.size()) {
-            g_pool->in_use[idx] = 1;
-        }
-        g_pool->outstanding.fetch_add(1, butil::memory_order_relaxed);
-        return buf;
-    }
-    LOG_EVERY_SECOND(WARNING)
-        << "URMA buffer pool exhausted; falling back to malloc";
-    return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-}
-
-void PoolDeallocate(void* buf) {
-    if (BAIDU_UNLIKELY(g_skip_urma_init)) {
-        if (g_mem_dealloc_orig) {
-            g_mem_dealloc_orig(buf);
-        } else {
-            free(buf);
-        }
-        return;
-    }
-    auto* base = static_cast<char*>(g_pool_base);
-    auto* p = static_cast<char*>(buf);
-    if (!base || p < base || p >= base + g_pool_size ||
-        static_cast<size_t>(p - base) % g_pool_buffer_size != 0) {
-        // Not a pool buffer -- hand back to the original allocator.
-        if (g_mem_dealloc_orig) {
-            g_mem_dealloc_orig(buf);
-        } else {
-            free(buf);
-        }
-        return;
-    }
-    auto shard = ShardFor(buf);
-    BAIDU_SCOPED_LOCK(g_pool->mutexes[shard]);
-    auto idx = static_cast<size_t>(p - base) / g_pool_buffer_size;
-    if (idx < g_pool->in_use.size()) {
-        if (!g_pool->in_use[idx]) {
-            LOG(WARNING) << "double-free of URMA pool buffer " << buf;
-            return;
-        }
-        g_pool->in_use[idx] = 0;
-    }
-    g_pool->free_lists[shard].push_back(buf);
-    if (g_pool->outstanding.load(butil::memory_order_relaxed) > 0) {
-        g_pool->outstanding.fetch_sub(1, butil::memory_order_relaxed);
-    }
-}
-
-// Register the pool: mmap one large region and urma_register_seg it.
-bool InitPool() {
-    if (g_pool_buffer_size == 0 || g_pool == nullptr) {
-        return false;
-    }
-    size_t count = g_pool->buffer_count();
-    if (count == 0) {
-        return false;
-    }
-    size_t raw = g_pool_buffer_size * count;
-    size_t page = PageSize();
-    g_pool_size = AlignUp(raw, page);
-
-    g_pool_base = mmap(nullptr, g_pool_size, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (g_pool_base == MAP_FAILED) {
-        PLOG(WARNING) << "Fail to mmap URMA buffer pool";
-        g_pool_base = nullptr;
-        return false;
-    }
-
-    urma_reg_seg_flag_t flag{};
-    flag.bs.token_policy = URMA_TOKEN_NONE;
-    flag.bs.cacheable = URMA_NON_CACHEABLE;
-    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
-
-    urma_seg_cfg_t cfg{};
-    cfg.va = reinterpret_cast<uint64_t>(g_pool_base);
-    cfg.len = g_pool_size;
-    cfg.token_id = nullptr;
-    cfg.token_value = {};
-    cfg.flag = flag;
-    cfg.user_ctx = reinterpret_cast<uint64_t>(g_pool_base);
-    cfg.iova = 0;
-
-    errno = 0;
-    g_pool_seg = urma_register_seg(g_context, &cfg);
-    if (!g_pool_seg) {
-        PLOG(WARNING) << "Fail to urma_register_seg";
-        munmap(g_pool_base, g_pool_size);
-        g_pool_base = nullptr;
-        return false;
-    }
-    g_pool->in_use.assign(count, 0);
-    for (size_t i = 0; i < count; ++i) {
-        auto shard = i % kShardCount;
-        g_pool->free_lists[shard].push_back(
-            static_cast<char*>(g_pool_base) + i * g_pool_buffer_size);
-    }
-    return true;
-}
-
-}  // namespace
-
-// Exposed to urma_endpoint.cpp: return the per-buffer target_seg pointer.
-// All pool buffers share the same segment, so we return g_pool_seg for any
-// pool address; the per-WR length selects the slice.
-urma_target_seg_t* GetPoolSegFor(void* buf) {
-    if (g_skip_urma_init || !g_pool_seg || !g_pool_base) {
-        return nullptr;
-    }
-    if (buf == nullptr) {
-        return g_pool_seg;
-    }
-    const uintptr_t base = reinterpret_cast<uintptr_t>(g_pool_base);
-    const uintptr_t p = reinterpret_cast<uintptr_t>(buf);
-    if (p >= base && p - base < g_pool_size) {
-        return g_pool_seg;
-    }
-    return nullptr;
-}
 
 static void GlobalRelease() {
     g_urma_available.store(false, butil::memory_order_release);
-    if (g_mem_alloc_orig) {
-        butil::iobuf::blockmem_allocate = g_mem_alloc_orig;
-        g_mem_alloc_orig = nullptr;
-    }
-    if (g_mem_dealloc_orig) {
-        butil::iobuf::blockmem_deallocate = g_mem_dealloc_orig;
-        g_mem_dealloc_orig = nullptr;
-    }
-    if (g_default_block_size_orig != 0) {
-        butil::SetDefaultBlockSize(g_default_block_size_orig);
-        g_default_block_size_orig = 0;
-    }
     UrmaEndpoint::GlobalRelease();
-    if (g_pool_seg) {
-        urma_unregister_seg(g_pool_seg);
-        g_pool_seg = nullptr;
+    if (g_urma_pool) {
+        LOG(ERROR) << "Keep registered memory/context because URMA queues could not stop";
+        return;
     }
-    if (g_pool_base) {
-        munmap(g_pool_base, g_pool_size);
-        g_pool_base = nullptr;
-        g_pool_size = 0;
+    if (!ReleaseUrmaMemoryPools()) {
+        LOG(ERROR) << "Keep URMA context because registered memory is still in use";
+        return;
     }
-    delete g_pool;
-    g_pool = nullptr;
     delete g_user_segs;
     g_user_segs = nullptr;
     delete g_user_segs_lock;
@@ -469,10 +208,18 @@ static bool GlobalUrmaInitializeImpl() {
         g_urma_available.store(true, butil::memory_order_release);
         return true;
     }
-    if (FLAGS_urma_sq_size < 16 || FLAGS_urma_sq_size > 4096 ||
-        FLAGS_urma_rq_size < 16 || FLAGS_urma_rq_size > 4096 ||
-        FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_count <= 0 ||
-        FLAGS_urma_poller_num <= 0) {
+    const int64_t rx_slots = int64_t(FLAGS_urma_io_jfr_cnt) * FLAGS_urma_io_rx_depth;
+    const int64_t tx_slots = int64_t(FLAGS_urma_io_jfs_cnt) * FLAGS_urma_io_sq_depth;
+    const int64_t pool_bytes = int64_t(FLAGS_urma_buffer_size) * FLAGS_urma_buffer_count +
+                              int64_t(64) * FLAGS_urma_header_buf_count;
+    if (FLAGS_urma_io_jfs_cnt <= 0 || FLAGS_urma_io_jfr_cnt <= 0 ||
+        FLAGS_urma_io_sq_depth <= 0 || FLAGS_urma_io_rx_depth <= 0 ||
+        FLAGS_urma_io_sq_depth > 65535 || FLAGS_urma_io_rx_depth > 65535 ||
+        FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_size % 64 != 0 ||
+        FLAGS_urma_buffer_count <= rx_slots ||
+        FLAGS_urma_header_buf_count < rx_slots + tx_slots ||
+        FLAGS_urma_memory_pool_limit_mb <= 0 ||
+        pool_bytes > int64_t(FLAGS_urma_memory_pool_limit_mb) * 1024 * 1024) {
         LOG(ERROR) << "Invalid URMA queue, buffer, or poller configuration";
         errno = EINVAL;
         return false;
@@ -556,9 +303,17 @@ static bool GlobalUrmaInitializeImpl() {
         LOG(ERROR) << "Fail to urma_create_context";
         return false;
     }
-    // The bonding provider only accepts SET_BONDING_MODE while the context
-    // has no dependent resource. This must precede register_seg/JFC/JFR.
-    if (!ConfigureBondingMode(device_name)) {
+    g_is_bonding_device = IsBondingDeviceName(device_name.c_str()) ||
+        (g_context->dev && IsBondingDeviceName(g_context->dev->name));
+    if (g_is_bonding_device || FLAGS_urma_use_polling) {
+        LOG(ERROR) << "Pooled URMA currently requires a non-bonding device and event mode";
+        errno = ENOTSUP;
+        return false;
+    }
+    if (g_device_attr.dev_cap.max_jfr_sge < 2 ||
+        g_device_attr.dev_cap.max_jfs_sge < (BRPC_URMA_SINGLE_SGE ? 1u : 2u)) {
+        LOG(ERROR) << "Pooled URMA requires two SGEs for header and body";
+        errno = ENOTSUP;
         return false;
     }
     uint32_t device_max_sge = g_device_attr.dev_cap.max_jfs_sge;
@@ -578,6 +333,10 @@ static bool GlobalUrmaInitializeImpl() {
             g_max_sge = FLAGS_urma_max_sge;
         }
     }
+    if (g_max_sge < (BRPC_URMA_SINGLE_SGE ? 1 : 2)) {
+        errno = EINVAL;
+        return false;
+    }
     g_recv_block_size =
         static_cast<size_t>(FLAGS_urma_buffer_size) -
         sizeof(butil::IOBuf::Block);
@@ -591,29 +350,16 @@ static bool GlobalUrmaInitializeImpl() {
         return false;
     }
 
-    // Buffer pool.
-    g_pool = new BufferPool();
-    g_pool_buffer_size = static_cast<size_t>(FLAGS_urma_buffer_size);
-    // Resize the pool's per-shard vectors to hold the configured count.
-    size_t count = static_cast<size_t>(FLAGS_urma_buffer_count);
-    g_pool->in_use.assign(count, 0);
-    for (size_t s = 0; s < kShardCount; ++s) {
-        g_pool->free_lists[s].reserve(count / kShardCount + 1);
-    }
-    if (!InitPool()) {
-        LOG(ERROR) << "Fail to init URMA buffer pool";
+    if (!InitializeUrmaMemoryPools(g_context, FLAGS_urma_buffer_size,
+                                   FLAGS_urma_buffer_count,
+                                   FLAGS_urma_header_buf_count)) {
+        LOG(ERROR) << "Fail to initialize URMA memory pools";
         return false;
     }
-
-    // Hijack IOBuf allocation so every IOBuf block is backed by a registered
-    // segment. This makes the send path trivial: any IOBuf can be posted
-    // directly as an urma_sge_t pointing at g_pool_seg.
-    g_mem_alloc_orig = butil::iobuf::blockmem_allocate;
-    g_mem_dealloc_orig = butil::iobuf::blockmem_deallocate;
-    g_default_block_size_orig = butil::GetDefaultBlockSize();
-    butil::iobuf::blockmem_allocate = PoolAllocate;
-    butil::iobuf::blockmem_deallocate = PoolDeallocate;
-    butil::SetDefaultBlockSize(g_pool_buffer_size);
+    LOG(INFO) << "URMA registered memory pools: data_bytes="
+              << int64_t(FLAGS_urma_buffer_size) * FLAGS_urma_buffer_count
+              << " header_bytes=" << int64_t(64) * FLAGS_urma_header_buf_count
+              << " limit_mib=" << FLAGS_urma_memory_pool_limit_mb;
 
     if (UrmaEndpoint::GlobalInitialize() != 0) {
         LOG(ERROR) << "Fail to initialize URMA endpoint resources";
@@ -629,8 +375,8 @@ static bool GlobalUrmaInitializeImpl() {
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
               << " max_sge=" << g_max_sge
-              << " buffer_size=" << g_pool_buffer_size
-              << " buffer_count=" << g_pool->buffer_count();
+              << " buffer_size=" << FLAGS_urma_buffer_size
+              << " buffer_count=" << FLAGS_urma_buffer_count;
     return true;
 }
 
