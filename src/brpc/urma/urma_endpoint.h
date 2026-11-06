@@ -258,7 +258,8 @@ private:
     std::shared_ptr<UrmaConnResource> _conn_res;
     SocketId _self_socket_id{INVALID_SOCKET_ID};
     SocketId _peer_socket_id{INVALID_SOCKET_ID};
-    // Selected on the first send; a full queue may temporarily spill to peers.
+    // Selected once when connection resources are allocated; a full queue may
+    // temporarily spill to peers.
     uint32_t _preferred_jfs{UINT32_MAX};
     uint16_t _next_send_seq{0};
     uint16_t _deliver_base{0};

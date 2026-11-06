@@ -197,6 +197,7 @@ void UrmaEndpoint::Reset() {
     _remote_recv_block_size = 0;
     _self_socket_id = INVALID_SOCKET_ID;
     _peer_socket_id = INVALID_SOCKET_ID;
+    _preferred_jfs = UINT32_MAX;
     _read_butex->store(0, butil::memory_order_relaxed);
 }
 
@@ -404,7 +405,8 @@ int UrmaEndpoint::ReadAndParseHelloV3(ParsedHello* out, bool* negotiated) {
 
 int UrmaEndpoint::AllocateResources() {
     if (_conn_res) { return 0; }
-    if (!g_urma_pool || g_urma_pool->io_jfr.empty()) {
+    if (!g_urma_pool || g_urma_pool->io_jfs.empty() ||
+        g_urma_pool->io_jfr.empty()) {
         errno = ENODEV;
         return -1;
     }
@@ -412,6 +414,8 @@ int UrmaEndpoint::AllocateResources() {
     _conn_res->local_jfr_index = g_urma_pool->PickJfr();
     _conn_res->imports = g_urma_pool->imports;
     _self_socket_id = _socket->id();
+    _preferred_jfs = UrmaResourcePool::PreferredJfs(
+        _self_socket_id, g_urma_pool->io_jfs.size());
     return 0;
 }
 
@@ -467,7 +471,6 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     if (!operation || _conn_res->failed.load(std::memory_order_acquire)) {
         errno = EIO; return -1;
     }
-    if (_preferred_jfs == UINT32_MAX) { _preferred_jfs = PreferredJfs(); }
     const uint32_t start = FLAGS_urma_jfs_affinity ? _preferred_jfs
         : g_urma_pool->jfs_rr_counter.fetch_add(1);
     butil::IOBuf remaining;
@@ -590,12 +593,13 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
 }
 
 uint32_t UrmaEndpoint::PreferredJfs() const {
-    return _preferred_jfs == UINT32_MAX
-        ? UrmaResourcePool::PreferredJfs(_self_socket_id, g_urma_pool->io_jfs.size())
-        : _preferred_jfs % g_urma_pool->io_jfs.size();
+    CHECK_NE(_preferred_jfs, UINT32_MAX)
+        << "Preferred JFS is initialized when URMA connection resources are allocated";
+    return _preferred_jfs;
 }
 bool UrmaEndpoint::IsWritable() const {
-    return g_urma_pool && g_urma_pool->IsWritable(PreferredJfs());
+    return g_urma_pool && _preferred_jfs != UINT32_MAX &&
+        g_urma_pool->IsWritable(_preferred_jfs);
 }
 
 void UrmaEndpoint::HandleTxCompletion(UrmaJfsSlot* slot, const urma_cr_t& cr) {
