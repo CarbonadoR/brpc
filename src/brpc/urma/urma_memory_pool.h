@@ -32,11 +32,27 @@ class UrmaMemoryPool {
 public:
     virtual ~UrmaMemoryPool() = default;
     virtual void* Allocate(size_t size) = 0;
+    virtual size_t AllocateBatch(size_t size, void** buffers, size_t capacity) {
+        if (!buffers || !capacity) { return 0; }
+        size_t count = 0;
+        while (count < capacity) {
+            void* p = Allocate(size);
+            if (!p) { break; }
+            buffers[count++] = p;
+        }
+        return count;
+    }
     virtual void Deallocate(void* buffer) = 0;
+    virtual void DeallocateBatch(void** buffers, size_t count) {
+        for (size_t i = 0; buffers && i < count; ++i) { Deallocate(buffers[i]); }
+    }
     virtual urma_target_seg_t* SegmentFor(const void* address) const = 0;
     virtual bool Owns(const void* address) const = 0;
     virtual size_t outstanding() const = 0;
     virtual bool Unregister() = 0;
+    // Pool shutdown follows quiescence; wrappers return per-thread cached
+    // buffers before checking outstanding ownership or unregistering memory.
+    virtual bool FlushCaches() { return true; }
 };
 
 // Fixed-size, sharded, registered mmap allocator; also used for raw 64B
