@@ -17,10 +17,13 @@ package(default_visibility = ["//visibility:public"])
 
 cc_library(
     name = "urma_headers",
-    hdrs = glob([
-        "src/urma/lib/urma/bond/include/*.h",
-        "src/urma/lib/urma/core/include/*.h",
-    ]),
+    hdrs = glob(
+        [
+            "src/urma/lib/urma/bond/include/*.h",
+            "src/urma/lib/urma/core/include/*.h",
+        ],
+        allow_empty = False,
+    ),
     includes = [
         "src/urma/lib/urma/bond/include",
         "src/urma/lib/urma/core/include",

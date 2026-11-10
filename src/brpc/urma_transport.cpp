@@ -80,7 +80,11 @@ int UrmaTransport::Reset(int32_t /*expected_nref*/) {
 }
 
 std::shared_ptr<AppConnect> UrmaTransport::Connect() {
-    if (_default_connect == nullptr) {
+    // Socket pools and short connections inherit the main socket's
+    // app_connect. UrmaConnect owns a pending handshake callback and must
+    // never be shared by concurrently connecting sockets.
+    if (_default_connect == nullptr ||
+        dynamic_cast<urma::UrmaConnect*>(_default_connect.get()) != nullptr) {
         return std::make_shared<urma::UrmaConnect>();
     }
     return _default_connect;
@@ -118,7 +122,8 @@ int UrmaTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
             // Same caveat as RDMA: URMA cannot detect failure by writing, so
             // after a failed butex wait we must re-check _socket->Failed().
             int rc =
-                bthread::butex_wait(epollout_butex, expected_val, &duetime);
+                urma::g_urma_pool->WaitWritable(epollout_butex, expected_val, &duetime,
+                                                  _urma_ep->PreferredJfs());
             if (rc < 0 && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
                 const int saved_errno = errno;
                 PLOG(ERROR) << "Fail to wait epollout butex";
@@ -157,15 +162,28 @@ void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
 
 void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
                                  int* num_bthread_created, bool last_msg) {
-    if (last_msg && !urma::FLAGS_urma_use_polling) {
+    // Keep only the newest parser-last message across the shared CQ callback.
+    // Superseded messages retain their own socket's dispatch attributes. This
+    // lets older candidates progress as more complete messages arrive.
+    auto* deferred = last_msg && _urma_ep ? _urma_ep->_deferred_message : nullptr;
+    if (deferred && !FLAGS_usercode_in_pthread) {
+        InputMessageBase* current = input_msg.release();
+        if (!current) { return; }
+        InputMessageBase* displaced = deferred->message;
+        InputMessageClosure previous;
+        previous.reset(displaced);
+        deferred->message = current;
+        if (displaced) {
+            displaced->socket()->_transport->QueueMessage(
+                previous, num_bthread_created, false);
+        }
         return;
     }
+    // A shared receive CQ must keep replenishing buffers even when an RPC
+    // callback blocks (including a response waiting on the shared SQ).
+    // Without deferred delivery, queue the last parsed message as well.
     InputMessageBase* to_run_msg = input_msg.release();
     if (!to_run_msg) {
-        return;
-    }
-    if (urma::FLAGS_urma_disable_bthread) {
-        Transport::ProcessInputMessage(to_run_msg);
         return;
     }
     bthread_t th;
@@ -175,7 +193,7 @@ void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
     tmp.keytable_pool = _socket->keytable_pool();
     tmp.tag = bthread_self_tag();
     bthread_attr_set_name(&tmp, "ProcessInputMessage");
-    if (!FLAGS_usercode_in_coroutine && bthread_start_background(
+    if (bthread_start_background(
             &th, &tmp, Transport::ProcessInputMessage, to_run_msg) == 0) {
         ++*num_bthread_created;
     } else {

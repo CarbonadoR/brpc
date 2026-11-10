@@ -23,6 +23,14 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/BrpcExample.cmake)
 option(LINK_SO "Whether examples are linked dynamically" OFF)
 
 brpc_example_find_common_deps(DYNAMIC_LIB)
+find_library(TCMALLOC_LIB NAMES tcmalloc)
+get_filename_component(TCMALLOC_LIB_DIR "${TCMALLOC_LIB}" DIRECTORY)
+find_path(TCMALLOC_INCLUDE_PATH NAMES gperftools/malloc_extension.h
+    HINTS "${TCMALLOC_LIB_DIR}/../include")
+if(NOT TCMALLOC_LIB OR NOT TCMALLOC_INCLUDE_PATH)
+    message(FATAL_ERROR "URMA examples require libtcmalloc and gperftools headers")
+endif()
+list(APPEND DYNAMIC_LIB ${TCMALLOC_LIB})
 
 protobuf_generate_cpp(PROTO_SRC PROTO_HEADER test.proto)
 set(BRPC_EXAMPLE_WITH_URMA ON)
@@ -52,3 +60,12 @@ brpc_example_configure_target(urma_performance_server)
 
 target_link_libraries(urma_performance_client PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
 target_link_libraries(urma_performance_server PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(urma_verify verify.cpp ${PROTO_SRC} ${PROTO_HEADER})
+brpc_example_configure_target(urma_verify)
+target_link_libraries(urma_verify PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})
+
+add_executable(urma_connection_stress connection_stress.cpp ${PROTO_SRC} ${PROTO_HEADER})
+brpc_example_configure_target(urma_connection_stress)
+target_include_directories(urma_connection_stress PRIVATE ${TCMALLOC_INCLUDE_PATH})
+target_link_libraries(urma_connection_stress PRIVATE ${BRPC_LIB} ${DYNAMIC_LIB})

@@ -30,6 +30,7 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
+#include "brpc/urma/urma_memory_pool.h"
 
 namespace brpc {
 DECLARE_bool(usercode_in_coroutine);

@@ -32,7 +32,6 @@ DEFINES = [
     "__const__=__unused__",
     "_GNU_SOURCE",
     "USE_SYMBOLIZE",
-    "NO_TCMALLOC",
     "__STDC_FORMAT_MACROS",
     "__STDC_LIMIT_MACROS",
     "__STDC_CONSTANT_MACROS",
@@ -53,7 +52,7 @@ DEFINES = [
      "//conditions:default": [],
  }) + select({
      "//bazel/config:brpc_with_urma": ["BRPC_WITH_URMA=1"],
-     "//conditions:default": [],
+     "//conditions:default": ["NO_TCMALLOC"],
  }) + select({
      "//bazel/config:brpc_with_ubring": ["BRPC_WITH_UBRING=1"],
      "//conditions:default": [],
@@ -590,6 +589,11 @@ cc_library(
         "src/brpc/event_dispatcher_kqueue.cpp",
     ]),
     copts = COPTS,
+    defines = select({
+        "//bazel/config:brpc_with_urma_single_sge": ["BRPC_URMA_SINGLE_SGE=1"],
+        "//bazel/config:brpc_with_urma": ["BRPC_URMA_SINGLE_SGE=0"],
+        "//conditions:default": [],
+    }),
     includes = ["src/"],
     linkopts = LINKOPTS + select({
         "//bazel/config:brpc_with_urma_use_real": ["-lurma"],
@@ -605,6 +609,9 @@ cc_library(
         ":mcpack2pb",
         "@com_github_google_leveldb//:leveldb",
     ] + select({
+        "//bazel/config:brpc_with_urma": ["@gperftools//:tcmalloc"],
+        "//conditions:default": [],
+    }) + select({
         "//bazel/config:brpc_with_urma_download_headers_disabled": [],
         "//bazel/config:brpc_with_urma": [
             "@umdk//:urma_headers",

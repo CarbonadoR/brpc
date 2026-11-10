@@ -58,8 +58,10 @@ single_version_override(
 )
 bazel_dep(name = 'thrift', version = '0.21.0', repo_name = 'org_apache_thrift')
 
+# Required by URMA and shared with the tests.
+bazel_dep(name = "gperftools", version = "2.18.1")
+
 # test only
-bazel_dep(name = "gperftools", version = "2.18.1", dev_dependency = True)
 bazel_dep(name = "nlohmann_json", version = "3.12.0", dev_dependency = True)
 bazel_dep(name = 'googletest', version = '1.14.0.bcr.1', repo_name = 'com_google_googletest', dev_dependency = True)
 bazel_dep(name = 'hedron_compile_commands', dev_dependency = True)
@@ -78,4 +80,7 @@ git_repository(
     build_file = '//bazel/third_party/umdk:umdk.BUILD',
     remote = 'https://atomgit.com/openeuler/umdk.git',
     commit = '564ee727a55523d4351a8fb3c94292b388ebb924',  # v26.06.0_CAM
+    # Use our header-only rule. The upstream package boundary hides its
+    # headers from the glob in umdk.BUILD.
+    patch_cmds = ['rm -f src/urma/BUILD.bazel'],
 )
